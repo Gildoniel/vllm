@@ -33,6 +33,7 @@ QuantizationMethods = Literal[
     "mxfp4",
     "petit_nvfp4",
     "cpu_awq",
+    "exl3",
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
@@ -113,6 +114,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         CompressedTensorsConfig,
     )
     from .cpu_wna16 import CPUAWQConfig
+    from .exl3 import EXL3Config
     from .experts_int8 import ExpertsInt8Config
     from .fbgemm_fp8 import FBGEMMFp8Config
     from .fp8 import Fp8Config
@@ -158,6 +160,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "mxfp4": Mxfp4Config,
         "petit_nvfp4": PetitNvFp4Config,
         "cpu_awq": CPUAWQConfig,
+        "exl3": EXL3Config,
     }
     # Update the `method_to_config` with customized quantization methods.
     method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)

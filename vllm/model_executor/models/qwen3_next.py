@@ -315,7 +315,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             )
 
         if self.shared_expert is not None:
-            final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
+            shared_out = final_hidden_states[0]
+            fused_out = final_hidden_states[1]
+            final_hidden_states = shared_out + fused_out
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -1354,6 +1356,7 @@ class Qwen3NextForCausalLM(
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
+            quant_config=self.quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
