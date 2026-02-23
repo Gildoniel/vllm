@@ -84,3 +84,43 @@ def had_r_128(
         result = result * post_scale.unsqueeze(0)
 
     out.copy_(result.reshape(orig_shape))
+
+
+def batched_had_r_128(
+    x_sorted: torch.Tensor,
+    scale_stacked: torch.Tensor,
+    expert_ids_expanded: torch.Tensor,
+    pre: bool = True,
+) -> torch.Tensor:
+    """
+    Batched Hadamard-128 with expert-indexed scales for fused MoE.
+
+    Instead of looping per-expert to apply had_r_128 with per-expert suh/svh,
+    this gathers the correct scale per token and applies Hadamard in one batch.
+
+    Args:
+        x_sorted: (EM, dim) float16 — sorted tokens (padded).
+        scale_stacked: (E, dim) float16 — per-expert scales (suh or svh).
+        expert_ids_expanded: (EM,) int32/int64 — expert ID per token row.
+        pre: If True, scale is applied before Hadamard (suh).
+             If False, scale is applied after Hadamard (svh).
+
+    Returns:
+        result: (EM, dim) float16
+    """
+    dim = x_sorted.shape[-1]
+    H = _get_had128(x_sorted.device)
+
+    # Gather per-token scale from stacked expert scales: 1 kernel
+    scale_per_token = scale_stacked[expert_ids_expanded]  # (EM, dim)
+
+    if pre:
+        # Pre-scale (suh): multiply then Hadamard
+        x_scaled = x_sorted * scale_per_token
+        result = torch.mm(x_scaled.reshape(-1, 128), H.T)
+        return result.reshape_as(x_sorted)
+    else:
+        # Post-scale (svh): Hadamard then multiply
+        result = torch.mm(x_sorted.reshape(-1, 128), H.T)
+        result = result.reshape_as(x_sorted)
+        return result * scale_per_token

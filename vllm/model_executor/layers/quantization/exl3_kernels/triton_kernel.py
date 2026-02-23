@@ -2103,3 +2103,353 @@ def exl3_multi_gemm(
             num_warps=num_warps, num_stages=num_stages,
         )
         return C
+
+
+# =============================================================================
+# Fused Multi-Expert MoE GEMM Kernel
+#
+# Processes ALL experts in ONE kernel launch using token indirection and
+# expert-indexed weight lookup. Reduces MoE GEMM launches from
+# ~150 (3 projections × ~50 active experts) to 3 (gate + up + down).
+#
+# Based on _exl3_gemm_kernel with two additions:
+#   1. Expert indexing: expert_ids[pid_m] offsets into B[E, tiles_k, tiles_n, wpt]
+#   2. Token indirection: sorted_token_ids[pid_m * BLOCK_M + ...] for A indexing
+# =============================================================================
+
+@triton.jit
+def _exl3_fused_moe_gemm_kernel(
+    # Pointers
+    A_ptr, B_ptr, C_ptr,
+    sorted_token_ids_ptr,    # (EM,) int32 — sorted token indices into A
+    expert_ids_ptr,          # (num_m_blocks,) int32 — expert ID per M-block
+    num_tokens_post_padded_ptr,  # (1,) int32 — actual valid EM (tensor for graph capture)
+    word_idx_ptr, next_word_idx_ptr, shift_ptr,
+    # Dimensions
+    M,                       # original number of tokens (for A bounds check)
+    N, K,
+    # Strides
+    stride_am, stride_ak,
+    stride_cm, stride_cn,
+    stride_be,               # B expert stride: B_ptr + eid * stride_be
+    # Tile layout
+    tiles_n,
+    # Compile-time constants
+    BLOCK_M: tl.constexpr,
+    WORDS_PER_TILE: tl.constexpr,
+    CB: tl.constexpr,
+):
+    """
+    Fused multi-expert EXL3 dequant + GEMM.
+
+    Grid: (num_m_blocks, tiles_n)
+    Each program computes a (BLOCK_M, 16) output tile for one expert's tokens.
+
+    B layout: (E, tiles_k, tiles_n, WORDS_PER_TILE) int32 — stacked expert weights.
+    A layout: (total_tokens, K) float16 — flat token buffer.
+    C layout: (EM, N) float16 — output indexed by sorted position.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Skip padding blocks beyond valid tokens (loaded from tensor for graph capture)
+    num_valid_m = tl.load(num_tokens_post_padded_ptr)
+    num_valid_m_blocks = (num_valid_m + BLOCK_M - 1) // BLOCK_M
+    if pid_m >= num_valid_m_blocks:
+        return
+
+    # Load expert ID for this M-block
+    off_expert = tl.load(expert_ids_ptr + pid_m)
+
+    # Skip invalid expert blocks (EP: expert not on this rank)
+    if off_expert < 0:
+        return
+
+    # Accumulator: (BLOCK_M, 16) in float32
+    acc = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+
+    # Load precomputed bit extraction tables
+    k_local = tl.arange(0, 16)[:, None]
+    n_local = tl.arange(0, 16)[None, :]
+    mat_pos = k_local * 16 + n_local
+
+    word_idx = tl.load(word_idx_ptr + mat_pos)
+    next_word_idx = tl.load(next_word_idx_ptr + mat_pos)
+    shift = tl.load(shift_ptr + mat_pos)
+    shift_hi = (32 - shift) & 31
+
+    # Load sorted token IDs for this M-block (token indirection)
+    offs_block = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    token_ids = tl.load(sorted_token_ids_ptr + offs_block)
+
+    # Expert-offset B pointer
+    B_expert = B_ptr + off_expert.to(tl.int64) * stride_be
+
+    # K-dimension loop
+    num_k_tiles = K // 16
+    for tk in range(num_k_tiles):
+        # Load A tile via token indirection: A[token_ids, tk*16:(tk+1)*16]
+        offs_k = tk * 16 + tl.arange(0, 16)
+        a_ptrs = A_ptr + token_ids[:, None].to(tl.int64) * stride_am + offs_k[None, :] * stride_ak
+        mask_m = token_ids[:, None] < M
+        a_tile = tl.load(a_ptrs, mask=mask_m, other=0.0).to(tl.float16)
+
+        # Load and dequant B tile for this expert
+        b_base = (tk * tiles_n + pid_n) * WORDS_PER_TILE
+        lo = tl.load(B_expert + b_base + word_idx)
+        hi = tl.load(B_expert + b_base + next_word_idx)
+        w = _dequant_tile(lo, hi, shift, shift_hi, CB)
+
+        acc += tl.dot(a_tile, w)
+
+    # Store C tile: C[pid_m * BLOCK_M + ..., pid_n * 16 + ...]
+    offs_n = pid_n * 16 + tl.arange(0, 16)
+    c_ptrs = C_ptr + offs_block[:, None].to(tl.int64) * stride_cm + offs_n[None, :] * stride_cn
+    mask_store = token_ids[:, None] < M
+    tl.store(c_ptrs, acc.to(tl.float16), mask=mask_store)
+
+
+@triton.jit
+def _exl3_fused_moe_gemm_splitk_kernel(
+    # Pointers
+    A_ptr, B_ptr, C_partial_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,  # (1,) int32 — actual valid EM (tensor for graph capture)
+    word_idx_ptr, next_word_idx_ptr, shift_ptr,
+    # Dimensions
+    M, N, K,
+    # Strides
+    stride_am, stride_ak,
+    stride_cp_split, stride_cp_m, stride_cp_n,
+    stride_be,
+    # Tile layout
+    tiles_n,
+    tiles_per_split,
+    # Compile-time constants
+    BLOCK_M: tl.constexpr,
+    WORDS_PER_TILE: tl.constexpr,
+    CB: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    """
+    Split-K variant of fused multi-expert MoE GEMM.
+
+    Grid: (num_m_blocks, tiles_n, split_k)
+    Writes partial results to C_partial[split, EM, N].
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    # Skip padding blocks beyond valid tokens (loaded from tensor for graph capture)
+    num_valid_m = tl.load(num_tokens_post_padded_ptr)
+    num_valid_m_blocks = (num_valid_m + BLOCK_M - 1) // BLOCK_M
+    if pid_m >= num_valid_m_blocks:
+        return
+
+    off_expert = tl.load(expert_ids_ptr + pid_m)
+
+    # Skip invalid expert blocks (EP: expert not on this rank)
+    if off_expert < 0:
+        return
+
+    acc = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+
+    k_local = tl.arange(0, 16)[:, None]
+    n_local = tl.arange(0, 16)[None, :]
+    mat_pos = k_local * 16 + n_local
+
+    word_idx = tl.load(word_idx_ptr + mat_pos)
+    next_word_idx = tl.load(next_word_idx_ptr + mat_pos)
+    shift = tl.load(shift_ptr + mat_pos)
+    shift_hi = (32 - shift) & 31
+
+    offs_block = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    token_ids = tl.load(sorted_token_ids_ptr + offs_block)
+
+    B_expert = B_ptr + off_expert.to(tl.int64) * stride_be
+
+    tk_start = pid_k * tiles_per_split
+    tk_end = tl.minimum(tk_start + tiles_per_split, K // 16)
+
+    for tk in range(tk_start, tk_end):
+        offs_k = tk * 16 + tl.arange(0, 16)
+        a_ptrs = A_ptr + token_ids[:, None].to(tl.int64) * stride_am + offs_k[None, :] * stride_ak
+        mask_m = token_ids[:, None] < M
+        a_tile = tl.load(a_ptrs, mask=mask_m, other=0.0).to(tl.float16)
+
+        b_base = (tk * tiles_n + pid_n) * WORDS_PER_TILE
+        lo = tl.load(B_expert + b_base + word_idx)
+        hi = tl.load(B_expert + b_base + next_word_idx)
+        w = _dequant_tile(lo, hi, shift, shift_hi, CB)
+
+        acc += tl.dot(a_tile, w)
+
+    offs_n = pid_n * 16 + tl.arange(0, 16)
+    c_ptrs = (C_partial_ptr
+              + pid_k * stride_cp_split
+              + offs_block[:, None].to(tl.int64) * stride_cp_m
+              + offs_n[None, :] * stride_cp_n)
+    mask_store = token_ids[:, None] < M
+    tl.store(c_ptrs, acc.to(tl.float16), mask=mask_store)
+
+
+# =============================================================================
+# Fused MoE GEMM Python wrapper
+# =============================================================================
+
+# Per-device cache for fused MoE split-K buffers
+_moe_splitk_buf_cache = {}
+
+
+def _get_moe_splitk_buf(split_k, EM, N, device):
+    """Get or allocate cached partial buffer for fused MoE split-K."""
+    key = (device, split_k)
+    if key not in _moe_splitk_buf_cache or \
+       _moe_splitk_buf_cache[key].shape[1] < EM or \
+       _moe_splitk_buf_cache[key].shape[2] < N:
+        _moe_splitk_buf_cache[key] = torch.empty(
+            (split_k, max(EM, 1), max(N, 1)),
+            dtype=torch.float16, device=device)
+    return _moe_splitk_buf_cache[key]
+
+
+def exl3_fused_moe_gemm(
+    A: torch.Tensor,
+    B_stacked: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: "int | torch.Tensor",
+    EM_max: int = 0,
+    bits: int = 4,
+    cb: int = 0,
+    num_valid_tokens: int = None,
+    split_k: int = 0,
+    B_i32: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    Fused multi-expert EXL3 dequant + GEMM for MoE layers.
+
+    Processes all experts in ONE kernel launch using sorted token dispatch.
+
+    Args:
+        A: Input activations, float16, shape (M, K). Pre-Hadamard-transformed.
+        B_stacked: Stacked expert weights, int16, shape (E, tiles_k, tiles_n, wpt).
+        sorted_token_ids: (EM,) int32 — token indices sorted by expert.
+            Padded to align to BLOCK_M. Padding entries have id >= M.
+        expert_ids: (num_m_blocks,) int32 — expert ID for each M-block.
+        num_tokens_post_padded: Total entries in sorted_token_ids (EM).
+            Can be int (eager) or 1-element tensor (graph capture safe).
+        EM_max: Fixed upper bound for output tensor rows and grid dims.
+            When 0 (default), derived from num_tokens_post_padded (int path).
+            When >0, used for all sizing (graph capture safe — no .item()).
+        bits: Bits per weight (1-8).
+        cb: Codebook variant (0, 1, 2).
+        num_valid_tokens: Number of real tokens (for bounds). Defaults to M.
+        split_k: Split-K factor. 0 = auto-select.
+        B_i32: Optional pre-computed int32 view of B_stacked.
+
+    Returns:
+        C: Output, float16, shape (EM_max, N) or (EM, N).
+    """
+    assert A.dtype == torch.float16
+    assert A.is_contiguous()
+    assert 1 <= bits <= 8
+    assert cb in (0, 1, 2)
+
+    M, K = A.shape
+    E = B_stacked.shape[0]
+    tiles_k, tiles_n = B_stacked.shape[1], B_stacked.shape[2]
+    N = tiles_n * 16
+    BLOCK_M = 16
+    WORDS_PER_TILE = 8 * bits
+
+    if num_valid_tokens is None:
+        num_valid_tokens = M
+
+    # Support both int and tensor for num_tokens_post_padded.
+    # When EM_max is provided, use it for all Python-level sizing (graph safe).
+    # The tensor is passed to the kernel for runtime bounds checking.
+    if isinstance(num_tokens_post_padded, torch.Tensor):
+        num_post_pad_tensor = num_tokens_post_padded.to(torch.int32)
+        if EM_max <= 0:
+            # Fallback: extract int (breaks graph capture, but backward compat)
+            EM_max = num_tokens_post_padded.item()
+    else:
+        # Scalar path: create 1-element tensor for kernel
+        if EM_max <= 0:
+            EM_max = num_tokens_post_padded
+        num_post_pad_tensor = torch.tensor(
+            [num_tokens_post_padded], dtype=torch.int32, device=A.device)
+
+    EM = EM_max
+    num_m_blocks = triton.cdiv(EM, BLOCK_M)
+
+    if B_i32 is None:
+        B_i32 = B_stacked.view(torch.int32)
+
+    word_idx_t, next_word_idx_t, shift_t = get_bit_tables(bits, A.device)
+
+    # Compute stride_be: number of int32 elements per expert in B
+    stride_be = B_i32.stride(0)
+
+    # Auto-select split-K config
+    if split_k == 0:
+        if _AUTOTUNE_DISABLED:
+            config = _heuristic_config(1, tiles_k, tiles_n)
+        else:
+            device_name = torch.cuda.get_device_name(A.device)
+            cache_key = (1, K, N, bits, cb, device_name)
+            cached = _tune_cache.get(cache_key)
+            if cached is not None:
+                config = cached
+            else:
+                config = autotune_splitk(1, K, N, bits, cb, A.device)
+        split_k, num_warps, num_stages, _ = config
+    else:
+        num_warps, num_stages = 2, 2
+
+    C = torch.zeros(EM, N, dtype=torch.float16, device=A.device)
+
+    if split_k > 1:
+        tiles_per_split = triton.cdiv(tiles_k, split_k)
+        partial_buf = _get_moe_splitk_buf(split_k, EM, N, A.device)
+        C_partial = partial_buf[:split_k, :EM, :N]
+        C_partial.zero_()  # Must zero: kernel skips remote expert blocks
+
+        grid = (num_m_blocks, tiles_n, split_k)
+        _exl3_fused_moe_gemm_splitk_kernel[grid](
+            A, B_i32, C_partial,
+            sorted_token_ids, expert_ids,
+            num_post_pad_tensor,
+            word_idx_t, next_word_idx_t, shift_t,
+            num_valid_tokens, N, K,
+            A.stride(0), A.stride(1),
+            C_partial.stride(0), C_partial.stride(1), C_partial.stride(2),
+            stride_be,
+            tiles_n, tiles_per_split,
+            BLOCK_M=BLOCK_M, WORDS_PER_TILE=WORDS_PER_TILE, CB=cb,
+            SPLIT_K=split_k,
+            num_warps=num_warps, num_stages=num_stages,
+        )
+
+        torch.sum(C_partial, dim=0, out=C)
+
+    else:
+        grid = (num_m_blocks, tiles_n)
+        _exl3_fused_moe_gemm_kernel[grid](
+            A, B_i32, C,
+            sorted_token_ids, expert_ids,
+            num_post_pad_tensor,
+            word_idx_t, next_word_idx_t, shift_t,
+            num_valid_tokens, N, K,
+            A.stride(0), A.stride(1),
+            C.stride(0), C.stride(1),
+            stride_be,
+            tiles_n,
+            BLOCK_M=BLOCK_M, WORDS_PER_TILE=WORDS_PER_TILE, CB=cb,
+            num_warps=num_warps, num_stages=num_stages,
+        )
+
+    return C

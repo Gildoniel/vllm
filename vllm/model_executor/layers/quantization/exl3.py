@@ -1534,9 +1534,12 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
+        from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+            moe_align_block_size,
+        )
         from vllm.model_executor.layers.quantization.exl3_kernels import (
-            exl3_gemm,
-            had_r_128,
+            batched_had_r_128,
+            exl3_fused_moe_gemm,
         )
 
         bits = layer.exl3_bits
@@ -1545,132 +1548,96 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         num_experts = layer.w1_trellis.shape[0]
         N_out = layer.w2_svh.shape[1]  # hidden_size
         total = M * top_k
+        BLOCK_M = 16
 
-        flat_topk_ids = topk_ids.reshape(-1)  # (total,)
         expert_map = getattr(layer, "expert_map", None)
 
-        # Two paths: eager (profiling/compilation) and graph capture (decode).
-        # Eager can use .item() and dynamic shapes; graph capture cannot.
-        capturing = torch.cuda.is_current_stream_capturing()
-
-        if not capturing:
-            # === EAGER PATH: sort by expert, process only active experts ===
-            # Efficient for large M (prefill/profiling). Uses .item() for
-            # expert boundaries — OK because not in graph capture.
-            x_expanded = x.unsqueeze(1).expand(
-                -1, top_k, -1).reshape(total, K)
-
-            # Map to local expert IDs
-            if expert_map is not None:
-                local_ids = expert_map[flat_topk_ids]
-            else:
-                local_ids = flat_topk_ids
-
-            # Sort by expert for coalesced access
-            sorted_indices = local_ids.argsort()
-            sorted_ids = local_ids[sorted_indices]
-            sorted_x = x_expanded[sorted_indices]
-
-            # Compute expert boundaries. Non-local tokens (id=-1) sort
-            # to the front; skip them by starting offsets after them.
-            num_invalid = (sorted_ids < 0).sum()
-            expert_counts = torch.zeros(
-                num_experts, dtype=torch.int64, device=x.device)
-            valid = sorted_ids >= 0
-            safe_ids = sorted_ids.clamp(min=0)
-            expert_counts.scatter_add_(
-                0, safe_ids,
-                valid.to(torch.int64),
-            )
-            expert_offsets = torch.zeros(
-                num_experts + 1, dtype=torch.int64, device=x.device)
-            expert_offsets[0] = num_invalid
-            torch.cumsum(expert_counts, dim=0, out=expert_offsets[1:])
-            expert_offsets[1:] += num_invalid
-
-            sorted_out = torch.zeros(
-                total, N_out, dtype=x.dtype, device=x.device)
-
-            for eid in range(num_experts):
-                count = expert_counts[eid].item()
-                if count == 0:
-                    continue
-                offset = expert_offsets[eid].item()
-                tokens = sorted_x[offset:offset + count]
-                down_h = self._apply_expert(
-                    layer, tokens, eid, bits, exl3_gemm, had_r_128)
-                sorted_out[offset:offset + count] = down_h
-
-            # Unsort
-            output = torch.empty_like(sorted_out)
-            output[sorted_indices] = sorted_out
-
+        # Global expert count for moe_align_block_size (topk_ids use
+        # global IDs; expert_map maps global→local).
+        if expert_map is not None:
+            global_num_experts = expert_map.shape[0]
         else:
-            # === GRAPH CAPTURE PATH ===
-            # No .item(), no boolean indexing, fixed shapes only.
-            # Two sub-paths based on M size:
-            #   Small M (decode): per-slot with index_select
-            #   Large M (prefill): all-experts with torch.where masking
-            if expert_map is not None:
-                local_ids = expert_map[flat_topk_ids]
-            else:
-                local_ids = flat_topk_ids
+            global_num_experts = num_experts
 
-            local_ids_safe = local_ids.clamp(min=0)
+        # === UNIFIED FUSED PATH (works in both eager and graph capture) ===
+        # One kernel launch per projection (gate/up/down) instead of
+        # per-expert loop. All tensor shapes are Python-int determined
+        # (EM_max, total, N_out). num_post_pad_t stays as tensor — kernel
+        # loads it for runtime bounds checking. No .item(), no
+        # GPU-data-dependent branches.
+        EM_max = top_k * BLOCK_M   # Fixed Python int — tight decode bound
 
-            x_expanded = x.unsqueeze(1).expand(
-                -1, top_k, -1).reshape(total, K)
-            output = torch.zeros(
-                total, N_out, dtype=x.dtype, device=x.device)
+        x_expanded = x.unsqueeze(1).expand(
+            -1, top_k, -1).reshape(total, K)
 
-            if total <= num_experts:
-                # -- Small M (decode): per-slot with index_select --
-                # total = M * top_k; for M=1 decode, total=10.
-                # index_select is a proper CUDA kernel that reads the
-                # index tensor on GPU at runtime — graph-safe. squeeze(0)
-                # and Python int indexing ([0], [1]) are views — also safe.
-                for k in range(total):
-                    idx = local_ids_safe[k:k+1]  # (1,) tensor
-                    token = x_expanded[k:k+1]
-                    down_h = self._apply_expert_gathered(
-                        token,
-                        torch.index_select(
-                            layer.w13_suh, 0, idx).squeeze(0),
-                        torch.index_select(
-                            layer.w1_trellis, 0, idx).squeeze(0),
-                        torch.index_select(
-                            layer.w1_svh, 0, idx).squeeze(0),
-                        torch.index_select(
-                            layer.w3_trellis, 0, idx).squeeze(0),
-                        torch.index_select(
-                            layer.w3_svh, 0, idx).squeeze(0),
-                        torch.index_select(
-                            layer.w2_suh, 0, idx).squeeze(0),
-                        torch.index_select(
-                            layer.w2_trellis, 0, idx).squeeze(0),
-                        torch.index_select(
-                            layer.w2_svh, 0, idx).squeeze(0),
-                        bits, exl3_gemm, had_r_128,
-                    )
-                    if expert_map is not None:
-                        valid = (local_ids[k] >= 0).reshape(1, 1)
-                        down_h = torch.where(
-                            valid, down_h, torch.zeros_like(down_h))
-                    output[k:k+1] = down_h
-            else:
-                # -- Large M (prefill): all-experts loop --
-                # Fixed num_experts iterations (64 for EP=8).
-                # Each iteration runs ALL tokens through one expert.
-                # torch.where selects valid results, ignoring NaN
-                # from wrong-expert fp16 overflow (IEEE 754:
-                # torch.where picks output when mask=False, so NaN
-                # in down_h never propagates to non-matching slots).
-                for eid in range(num_experts):
-                    mask = (local_ids == eid).unsqueeze(1)
-                    down_h = self._apply_expert(
-                        layer, x_expanded, eid, bits,
-                        exl3_gemm, had_r_128)
-                    output = torch.where(mask, down_h, output)
+        sorted_token_ids, expert_ids, num_post_pad_t = \
+            moe_align_block_size(
+                topk_ids, BLOCK_M, global_num_experts, expert_map)
+
+        # Gather: fixed-size EM_max rows (no .item() needed)
+        num_m_blocks = EM_max // BLOCK_M  # = top_k, Python int
+        tid_clamped = sorted_token_ids[:EM_max].clamp(
+            max=total - 1).long()
+        x_sorted = x_expanded[tid_clamped]
+
+        eid_blocks = expert_ids[:num_m_blocks]
+        eid_per_token = eid_blocks.repeat_interleave(
+            BLOCK_M).clamp(min=0)
+
+        identity_ids = torch.arange(
+            EM_max, device=x.device, dtype=sorted_token_ids.dtype)
+
+        # Gate projection: Had → GEMM → Had
+        xh_gate = batched_had_r_128(
+            x_sorted, layer.w13_suh[:, 0, :],
+            eid_per_token, pre=True)
+        gate = exl3_fused_moe_gemm(
+            xh_gate, layer.w1_trellis,
+            identity_ids, eid_blocks,
+            num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
+            B_i32=layer.w1_trellis_i32)
+        gate_h = batched_had_r_128(
+            gate, layer.w1_svh,
+            eid_per_token, pre=False)
+
+        # Up projection: Had → GEMM → Had
+        xh_up = batched_had_r_128(
+            x_sorted, layer.w13_suh[:, 1, :],
+            eid_per_token, pre=True)
+        up = exl3_fused_moe_gemm(
+            xh_up, layer.w3_trellis,
+            identity_ids, eid_blocks,
+            num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
+            B_i32=layer.w3_trellis_i32)
+        up_h = batched_had_r_128(
+            up, layer.w3_svh,
+            eid_per_token, pre=False)
+
+        hidden = F.silu(gate_h) * up_h
+
+        # Down projection: Had → GEMM → Had
+        xh_down = batched_had_r_128(
+            hidden, layer.w2_suh,
+            eid_per_token, pre=True)
+        down = exl3_fused_moe_gemm(
+            xh_down, layer.w2_trellis,
+            identity_ids, eid_blocks,
+            num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
+            B_i32=layer.w2_trellis_i32)
+        down_h = batched_had_r_128(
+            down, layer.w2_svh,
+            eid_per_token, pre=False)
+
+        # Scatter back to token order (padding → discard row)
+        output_buf = torch.zeros(
+            total + 1, N_out, dtype=x.dtype, device=x.device)
+        scatter_ids = sorted_token_ids[:EM_max].clamp(
+            min=0, max=total).long()
+        scatter_ids_2d = scatter_ids.unsqueeze(1).expand(
+            -1, N_out)
+        output_buf.scatter_(
+            0, scatter_ids_2d, down_h.to(x.dtype))
+        output = output_buf[:total]
 
         # Apply routing weights and sum over top_k
         output = output.reshape(M, top_k, N_out)
