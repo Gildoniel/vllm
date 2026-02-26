@@ -525,10 +525,10 @@ class BenchmarkWorker:
         torch.set_default_device("cuda")
         set_random_seed(seed)
         self.seed = seed
-        # Get the device ID to allocate tensors and kernels
-        # on the respective GPU. This is required for Ray to work
-        # correctly with multi-GPU tuning on the ROCm platform.
-        self.device_id = int(ray.get_gpu_ids()[0])
+        # Ray restricts each worker to 1 GPU via HIP/CUDA_VISIBLE_DEVICES.
+        # The worker always sees device 0 locally, regardless of the
+        # physical GPU ID Ray assigned.
+        self.device_id = 0
 
     def benchmark(
         self,
@@ -901,15 +901,9 @@ def main(args: argparse.Namespace):
 
     use_deep_gemm = bool(args.use_deep_gemm)
 
-    if current_platform.is_rocm() and "HIP_VISIBLE_DEVICES" in os.environ:
-        # Ray will set ROCR_VISIBLE_DEVICES for device visibility
-        logger.warning(
-            "Ray uses ROCR_VISIBLE_DEVICES to control device accessibility."
-            "Replacing HIP_VISIBLE_DEVICES with ROCR_VISIBLE_DEVICES."
-        )
-        val = os.environ["HIP_VISIBLE_DEVICES"]
-        os.environ["ROCR_VISIBLE_DEVICES"] = val
-        del os.environ["HIP_VISIBLE_DEVICES"]
+    # NOTE: Removed broken HIP_VISIBLE_DEVICES -> ROCR_VISIBLE_DEVICES
+    # conversion that conflicts with Ray's own AMD GPU accelerator manager.
+    # Ray handles device visibility internally.
 
     ray.init()
     num_gpus = int(ray.available_resources()["GPU"])

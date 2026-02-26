@@ -773,26 +773,67 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
-            initial_state[~has_initial_state, ...] = 0
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = self.chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=non_spec_query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-            )
-            # Init cache
-            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                ssm_state.dtype
-            )
+            if current_platform.is_rocm():
+                # ROCm: chunk_gated_delta_rule Triton kernels have shared
+                # memory issues on RDNA3 (<=64KB). Use fused_recurrent path
+                # which processes tokens sequentially but is correct.
+                #
+                # The fused_recurrent kernel with INPLACE_FINAL_STATE indexes
+                # ssm_state_indices[i_n, i_t] for EVERY token i_t. For prefill
+                # we want all tokens to map to the same state slot, so we
+                # expand the 1D indices to 2D [N, max_seqlen].
+                cu_seqlens_prefill = non_spec_query_start_loc[
+                    : attn_metadata.num_prefills + 1
+                ]
+                seq_lens = (
+                    cu_seqlens_prefill[1:] - cu_seqlens_prefill[:-1]
+                )
+                max_seqlen = seq_lens.max().item()
+                # Expand state indices: [N] -> [N, max_seqlen]
+                ssm_indices_2d = (
+                    non_spec_state_indices_tensor.unsqueeze(1)
+                    .expand(-1, max_seqlen)
+                    .contiguous()
+                )
+                ssm_state[
+                    non_spec_state_indices_tensor[~has_initial_state]
+                ] = 0
+                (
+                    core_attn_out_non_spec,
+                    _,
+                ) = fused_recurrent_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=ssm_state,
+                    inplace_final_state=True,
+                    cu_seqlens=cu_seqlens_prefill,
+                    ssm_state_indices=ssm_indices_2d,
+                    use_qk_l2norm_in_kernel=True,
+                )
+            else:
+                initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
+                initial_state[~has_initial_state, ...] = 0
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = self.chunk_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=non_spec_query_start_loc,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                # Init cache
+                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
         elif attn_metadata.num_decodes > 0:
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
@@ -1071,6 +1112,7 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
         hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:
@@ -1162,6 +1204,7 @@ class Qwen3NextModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

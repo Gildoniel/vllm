@@ -2296,6 +2296,409 @@ def _exl3_fused_moe_gemm_splitk_kernel(
 
 
 # =============================================================================
+# Fused MoE GEMM + Hadamard-128 epilogue (non-split-K)
+#
+# Combines MoE routing (token indirection, expert B stride, EP skip) with
+# the 8-accumulator Had-128 epilogue (H_16 matmul + H_8 butterfly + SVH).
+# SVH is per-expert indexed: svh_ptr + off_expert * stride_svh_e + col_offset.
+#
+# Saves one kernel launch per projection vs separate GEMM + batched_had_r_128.
+# =============================================================================
+
+@triton.jit
+def _exl3_fused_moe_gemm_had128_kernel(
+    # Pointers
+    A_ptr, B_ptr, C_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    word_idx_ptr, next_word_idx_ptr, shift_ptr,
+    H16_ptr,           # (16, 16) fp16 normalized Hadamard
+    svh_ptr,           # (E, N) fp16 per-expert sign-flips
+    # Dimensions
+    M, N, K,
+    # Strides
+    stride_am, stride_ak,
+    stride_cm, stride_cn,
+    stride_be,          # B expert stride
+    stride_svh_e,       # SVH expert stride (N elements)
+    stride_h16_r, stride_h16_c,
+    # Tile layout
+    tiles_n,
+    # Compile-time constants
+    BLOCK_M: tl.constexpr,
+    WORDS_PER_TILE: tl.constexpr,
+    CB: tl.constexpr,
+    HAS_SVH: tl.constexpr,
+):
+    """
+    Fused multi-expert EXL3 dequant + GEMM + Hadamard-128 epilogue.
+
+    Grid: (num_m_blocks, N // 128)
+    Each program computes a (BLOCK_M, 128) output tile with fused H_128.
+    """
+    pid_m = tl.program_id(0)
+    pid_n128 = tl.program_id(1)
+
+    # Skip padding blocks beyond valid tokens
+    num_valid_m = tl.load(num_tokens_post_padded_ptr)
+    num_valid_m_blocks = (num_valid_m + BLOCK_M - 1) // BLOCK_M
+    if pid_m >= num_valid_m_blocks:
+        return
+
+    # Load expert ID for this M-block
+    off_expert = tl.load(expert_ids_ptr + pid_m)
+
+    # Skip invalid expert blocks (EP: expert not on this rank)
+    if off_expert < 0:
+        return
+
+    # Load bit extraction tables
+    k_local = tl.arange(0, 16)[:, None]
+    n_local = tl.arange(0, 16)[None, :]
+    mat_pos = k_local * 16 + n_local
+    word_idx = tl.load(word_idx_ptr + mat_pos)
+    next_word_idx = tl.load(next_word_idx_ptr + mat_pos)
+    shift = tl.load(shift_ptr + mat_pos)
+    shift_hi = (32 - shift) & 31
+
+    # Load sorted token IDs for this M-block
+    offs_block = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    token_ids = tl.load(sorted_token_ids_ptr + offs_block)
+
+    # Expert-offset B pointer
+    B_expert = B_ptr + off_expert.to(tl.int64) * stride_be
+
+    # 8 accumulators, one per 16-col group within the 128-col block
+    acc0 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+    acc3 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+    acc4 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+    acc5 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+    acc6 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+    acc7 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+
+    # Base N-tile index for this 128-col block
+    base_n_tile = pid_n128 * 8
+
+    # K-loop
+    num_k_tiles = K // 16
+    for tk in range(num_k_tiles):
+        # Load A tile via token indirection
+        offs_k = tk * 16 + tl.arange(0, 16)
+        a_ptrs = A_ptr + token_ids[:, None].to(tl.int64) * stride_am + offs_k[None, :] * stride_ak
+        mask_m = token_ids[:, None] < M
+        a_tile = tl.load(a_ptrs, mask=mask_m, other=0.0).to(tl.float16)
+
+        # Dequant and accumulate for each of the 8 B tile columns
+        for g in tl.static_range(8):
+            b_col = base_n_tile + g
+            b_base = (tk * tiles_n + b_col) * WORDS_PER_TILE
+            lo = tl.load(B_expert + b_base + word_idx)
+            hi = tl.load(B_expert + b_base + next_word_idx)
+            w = _dequant_tile(lo, hi, shift, shift_hi, CB)
+
+            if g == 0:
+                acc0 += tl.dot(a_tile, w)
+            elif g == 1:
+                acc1 += tl.dot(a_tile, w)
+            elif g == 2:
+                acc2 += tl.dot(a_tile, w)
+            elif g == 3:
+                acc3 += tl.dot(a_tile, w)
+            elif g == 4:
+                acc4 += tl.dot(a_tile, w)
+            elif g == 5:
+                acc5 += tl.dot(a_tile, w)
+            elif g == 6:
+                acc6 += tl.dot(a_tile, w)
+            elif g == 7:
+                acc7 += tl.dot(a_tile, w)
+
+    # --- Epilogue: H_128 = H_8 ⊗ H_16 ---
+
+    # Load H_16 matrix (16x16, fp16)
+    h16_r = tl.arange(0, 16)[:, None]
+    h16_c = tl.arange(0, 16)[None, :]
+    H16 = tl.load(H16_ptr + h16_r * stride_h16_r + h16_c * stride_h16_c)
+
+    # Step 1: H_16 within each group
+    acc0 = tl.dot(acc0.to(tl.float16), H16).to(tl.float32)
+    acc1 = tl.dot(acc1.to(tl.float16), H16).to(tl.float32)
+    acc2 = tl.dot(acc2.to(tl.float16), H16).to(tl.float32)
+    acc3 = tl.dot(acc3.to(tl.float16), H16).to(tl.float32)
+    acc4 = tl.dot(acc4.to(tl.float16), H16).to(tl.float32)
+    acc5 = tl.dot(acc5.to(tl.float16), H16).to(tl.float32)
+    acc6 = tl.dot(acc6.to(tl.float16), H16).to(tl.float32)
+    acc7 = tl.dot(acc7.to(tl.float16), H16).to(tl.float32)
+
+    # Step 2: H_8 butterfly across 8 groups (3 rounds, in fp32)
+    t0 = acc0 + acc1
+    t1 = acc0 - acc1
+    t2 = acc2 + acc3
+    t3 = acc2 - acc3
+    t4 = acc4 + acc5
+    t5 = acc4 - acc5
+    t6 = acc6 + acc7
+    t7 = acc6 - acc7
+
+    s0 = t0 + t2
+    s1 = t1 + t3
+    s2 = t0 - t2
+    s3 = t1 - t3
+    s4 = t4 + t6
+    s5 = t5 + t7
+    s6 = t4 - t6
+    s7 = t5 - t7
+
+    acc0 = s0 + s4
+    acc1 = s1 + s5
+    acc2 = s2 + s6
+    acc3 = s3 + s7
+    acc4 = s0 - s4
+    acc5 = s1 - s5
+    acc6 = s2 - s6
+    acc7 = s3 - s7
+
+    # Scale: 1/sqrt(8) for H_8 (H_16 already has 1/sqrt(16) baked in)
+    inv_sqrt8: tl.constexpr = 0.35355339059327373
+    acc0 = acc0 * inv_sqrt8
+    acc1 = acc1 * inv_sqrt8
+    acc2 = acc2 * inv_sqrt8
+    acc3 = acc3 * inv_sqrt8
+    acc4 = acc4 * inv_sqrt8
+    acc5 = acc5 * inv_sqrt8
+    acc6 = acc6 * inv_sqrt8
+    acc7 = acc7 * inv_sqrt8
+
+    # Step 3: per-expert SVH sign-flip
+    if HAS_SVH:
+        svh_base = svh_ptr + off_expert.to(tl.int64) * stride_svh_e + pid_n128 * 128
+        svh_offs = tl.arange(0, 16)[None, :]
+        svh0 = tl.load(svh_base + 0 * 16 + svh_offs).to(tl.float32)
+        svh1 = tl.load(svh_base + 1 * 16 + svh_offs).to(tl.float32)
+        svh2 = tl.load(svh_base + 2 * 16 + svh_offs).to(tl.float32)
+        svh3 = tl.load(svh_base + 3 * 16 + svh_offs).to(tl.float32)
+        svh4 = tl.load(svh_base + 4 * 16 + svh_offs).to(tl.float32)
+        svh5 = tl.load(svh_base + 5 * 16 + svh_offs).to(tl.float32)
+        svh6 = tl.load(svh_base + 6 * 16 + svh_offs).to(tl.float32)
+        svh7 = tl.load(svh_base + 7 * 16 + svh_offs).to(tl.float32)
+        acc0 = acc0 * svh0
+        acc1 = acc1 * svh1
+        acc2 = acc2 * svh2
+        acc3 = acc3 * svh3
+        acc4 = acc4 * svh4
+        acc5 = acc5 * svh5
+        acc6 = acc6 * svh6
+        acc7 = acc7 * svh7
+
+    # Store all 8 groups: C[offs_block, ...] (sorted position)
+    mask_store = token_ids[:, None] < M
+    for g in tl.static_range(8):
+        offs_n = pid_n128 * 128 + g * 16 + tl.arange(0, 16)
+        c_ptrs = C_ptr + offs_block[:, None].to(tl.int64) * stride_cm + offs_n[None, :] * stride_cn
+        if g == 0:
+            tl.store(c_ptrs, acc0.to(tl.float16), mask=mask_store)
+        elif g == 1:
+            tl.store(c_ptrs, acc1.to(tl.float16), mask=mask_store)
+        elif g == 2:
+            tl.store(c_ptrs, acc2.to(tl.float16), mask=mask_store)
+        elif g == 3:
+            tl.store(c_ptrs, acc3.to(tl.float16), mask=mask_store)
+        elif g == 4:
+            tl.store(c_ptrs, acc4.to(tl.float16), mask=mask_store)
+        elif g == 5:
+            tl.store(c_ptrs, acc5.to(tl.float16), mask=mask_store)
+        elif g == 6:
+            tl.store(c_ptrs, acc6.to(tl.float16), mask=mask_store)
+        elif g == 7:
+            tl.store(c_ptrs, acc7.to(tl.float16), mask=mask_store)
+
+
+# =============================================================================
+# Fused MoE split-K reduce + Hadamard-128 kernel
+#
+# Sums SPLIT_K partial results from _exl3_fused_moe_gemm_splitk_kernel,
+# then applies H_128 epilogue + per-expert SVH sign-flip.
+# =============================================================================
+
+@triton.jit
+def _moe_reduce_had128_kernel(
+    C_partial_ptr, C_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    H16_ptr, svh_ptr,
+    # Dimensions
+    M, N, EM_max,
+    # Strides
+    stride_cp_split, stride_cp_m, stride_cp_n,
+    stride_cm, stride_cn,
+    stride_svh_e,
+    stride_h16_r, stride_h16_c,
+    # Compile-time constants
+    BLOCK_M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    HAS_SVH: tl.constexpr,
+):
+    """
+    Fused reduce + H_128 + per-expert SVH for MoE split-K partial results.
+
+    Grid: (num_m_blocks, N // 128)
+    """
+    pid_m = tl.program_id(0)
+    pid_n128 = tl.program_id(1)
+
+    # Skip padding blocks beyond valid tokens
+    num_valid_m = tl.load(num_tokens_post_padded_ptr)
+    num_valid_m_blocks = (num_valid_m + BLOCK_M - 1) // BLOCK_M
+    if pid_m >= num_valid_m_blocks:
+        return
+
+    off_expert = tl.load(expert_ids_ptr + pid_m)
+    if off_expert < 0:
+        return
+
+    offs_block = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    token_ids = tl.load(sorted_token_ids_ptr + offs_block)
+
+    # Sum partials for each of the 8 groups
+    acc0 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+    acc3 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+    acc4 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+    acc5 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+    acc6 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+    acc7 = tl.zeros((BLOCK_M, 16), dtype=tl.float32)
+
+    for sk in range(SPLIT_K):
+        for g in tl.static_range(8):
+            offs_n = pid_n128 * 128 + g * 16 + tl.arange(0, 16)
+            cp_ptrs = (C_partial_ptr
+                       + sk * stride_cp_split
+                       + offs_block[:, None].to(tl.int64) * stride_cp_m
+                       + offs_n[None, :] * stride_cp_n)
+            mask_load = token_ids[:, None] < M
+            partial = tl.load(cp_ptrs, mask=mask_load, other=0.0).to(tl.float32)
+
+            if g == 0:
+                acc0 += partial
+            elif g == 1:
+                acc1 += partial
+            elif g == 2:
+                acc2 += partial
+            elif g == 3:
+                acc3 += partial
+            elif g == 4:
+                acc4 += partial
+            elif g == 5:
+                acc5 += partial
+            elif g == 6:
+                acc6 += partial
+            elif g == 7:
+                acc7 += partial
+
+    # --- H_128 epilogue ---
+
+    h16_r = tl.arange(0, 16)[:, None]
+    h16_c = tl.arange(0, 16)[None, :]
+    H16 = tl.load(H16_ptr + h16_r * stride_h16_r + h16_c * stride_h16_c)
+
+    # Step 1: H_16 per group
+    acc0 = tl.dot(acc0.to(tl.float16), H16).to(tl.float32)
+    acc1 = tl.dot(acc1.to(tl.float16), H16).to(tl.float32)
+    acc2 = tl.dot(acc2.to(tl.float16), H16).to(tl.float32)
+    acc3 = tl.dot(acc3.to(tl.float16), H16).to(tl.float32)
+    acc4 = tl.dot(acc4.to(tl.float16), H16).to(tl.float32)
+    acc5 = tl.dot(acc5.to(tl.float16), H16).to(tl.float32)
+    acc6 = tl.dot(acc6.to(tl.float16), H16).to(tl.float32)
+    acc7 = tl.dot(acc7.to(tl.float16), H16).to(tl.float32)
+
+    # Step 2: H_8 butterfly
+    t0 = acc0 + acc1
+    t1 = acc0 - acc1
+    t2 = acc2 + acc3
+    t3 = acc2 - acc3
+    t4 = acc4 + acc5
+    t5 = acc4 - acc5
+    t6 = acc6 + acc7
+    t7 = acc6 - acc7
+
+    s0 = t0 + t2
+    s1 = t1 + t3
+    s2 = t0 - t2
+    s3 = t1 - t3
+    s4 = t4 + t6
+    s5 = t5 + t7
+    s6 = t4 - t6
+    s7 = t5 - t7
+
+    acc0 = s0 + s4
+    acc1 = s1 + s5
+    acc2 = s2 + s6
+    acc3 = s3 + s7
+    acc4 = s0 - s4
+    acc5 = s1 - s5
+    acc6 = s2 - s6
+    acc7 = s3 - s7
+
+    inv_sqrt8: tl.constexpr = 0.35355339059327373
+    acc0 = acc0 * inv_sqrt8
+    acc1 = acc1 * inv_sqrt8
+    acc2 = acc2 * inv_sqrt8
+    acc3 = acc3 * inv_sqrt8
+    acc4 = acc4 * inv_sqrt8
+    acc5 = acc5 * inv_sqrt8
+    acc6 = acc6 * inv_sqrt8
+    acc7 = acc7 * inv_sqrt8
+
+    # Step 3: per-expert SVH sign-flip
+    if HAS_SVH:
+        svh_base = svh_ptr + off_expert.to(tl.int64) * stride_svh_e + pid_n128 * 128
+        svh_offs = tl.arange(0, 16)[None, :]
+        svh0 = tl.load(svh_base + 0 * 16 + svh_offs).to(tl.float32)
+        svh1 = tl.load(svh_base + 1 * 16 + svh_offs).to(tl.float32)
+        svh2 = tl.load(svh_base + 2 * 16 + svh_offs).to(tl.float32)
+        svh3 = tl.load(svh_base + 3 * 16 + svh_offs).to(tl.float32)
+        svh4 = tl.load(svh_base + 4 * 16 + svh_offs).to(tl.float32)
+        svh5 = tl.load(svh_base + 5 * 16 + svh_offs).to(tl.float32)
+        svh6 = tl.load(svh_base + 6 * 16 + svh_offs).to(tl.float32)
+        svh7 = tl.load(svh_base + 7 * 16 + svh_offs).to(tl.float32)
+        acc0 = acc0 * svh0
+        acc1 = acc1 * svh1
+        acc2 = acc2 * svh2
+        acc3 = acc3 * svh3
+        acc4 = acc4 * svh4
+        acc5 = acc5 * svh5
+        acc6 = acc6 * svh6
+        acc7 = acc7 * svh7
+
+    # Store
+    mask_store = token_ids[:, None] < M
+    for g in tl.static_range(8):
+        offs_n = pid_n128 * 128 + g * 16 + tl.arange(0, 16)
+        c_ptrs = C_ptr + offs_block[:, None].to(tl.int64) * stride_cm + offs_n[None, :] * stride_cn
+        if g == 0:
+            tl.store(c_ptrs, acc0.to(tl.float16), mask=mask_store)
+        elif g == 1:
+            tl.store(c_ptrs, acc1.to(tl.float16), mask=mask_store)
+        elif g == 2:
+            tl.store(c_ptrs, acc2.to(tl.float16), mask=mask_store)
+        elif g == 3:
+            tl.store(c_ptrs, acc3.to(tl.float16), mask=mask_store)
+        elif g == 4:
+            tl.store(c_ptrs, acc4.to(tl.float16), mask=mask_store)
+        elif g == 5:
+            tl.store(c_ptrs, acc5.to(tl.float16), mask=mask_store)
+        elif g == 6:
+            tl.store(c_ptrs, acc6.to(tl.float16), mask=mask_store)
+        elif g == 7:
+            tl.store(c_ptrs, acc7.to(tl.float16), mask=mask_store)
+
+
+# =============================================================================
 # Fused MoE GEMM Python wrapper
 # =============================================================================
 
@@ -2449,6 +2852,247 @@ def exl3_fused_moe_gemm(
             stride_be,
             tiles_n,
             BLOCK_M=BLOCK_M, WORDS_PER_TILE=WORDS_PER_TILE, CB=cb,
+            num_warps=num_warps, num_stages=num_stages,
+        )
+
+    return C
+
+
+# =============================================================================
+# Fused MoE GEMM + Hadamard-128 Python wrapper
+# =============================================================================
+
+# Auto-tune cache for fused MoE Had kernels
+_moe_had_tune_cache = {}
+
+# Disk cache path
+_MOE_HAD_TUNE_CACHE_FILE = os.environ.get(
+    "EXL3_MOE_HAD_CACHE",
+    os.path.join(str(Path.home()), ".cache", "exl3_triton", "moe_had_cache.json"),
+)
+
+
+def _load_moe_had_disk_cache():
+    """Load fused MoE Had tune cache from disk."""
+    try:
+        with open(_MOE_HAD_TUNE_CACHE_FILE, "r") as f:
+            disk_data = json.load(f)
+        for key_str, val in disk_data.items():
+            parts = key_str.split("|")
+            if len(parts) == 6:
+                device_name, M, K, N, bits, cb = parts
+                cache_key = (int(M), int(K), int(N), int(bits), int(cb), device_name)
+                _moe_had_tune_cache[cache_key] = _normalize_config(val)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        pass
+
+
+def _save_moe_had_to_disk_cache(cache_key, config):
+    """Save a single entry to the fused MoE Had disk cache."""
+    M, K, N, bits, cb, device_name = cache_key
+    key_str = f"{device_name}|{M}|{K}|{N}|{bits}|{cb}"
+
+    disk_data = {}
+    try:
+        with open(_MOE_HAD_TUNE_CACHE_FILE, "r") as f:
+            disk_data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    disk_data[key_str] = list(config)
+
+    os.makedirs(os.path.dirname(_MOE_HAD_TUNE_CACHE_FILE), exist_ok=True)
+    with open(_MOE_HAD_TUNE_CACHE_FILE, "w") as f:
+        json.dump(disk_data, f, indent=2)
+
+
+# Load eagerly at import time
+_load_moe_had_disk_cache()
+
+
+def exl3_fused_moe_gemm_had(
+    A: torch.Tensor,
+    B_stacked: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: "int | torch.Tensor",
+    svh_stacked: torch.Tensor,
+    EM_max: int = 0,
+    bits: int = 4,
+    cb: int = 0,
+    num_valid_tokens: int = None,
+    split_k: int = 0,
+    B_i32: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    Fused multi-expert EXL3 dequant + GEMM + output Hadamard-128 + per-expert SVH.
+
+    Equivalent to: batched_had_r_128(exl3_fused_moe_gemm(...), svh, eid, pre=False)
+    but fused into fewer kernel launches (saves 1 launch per projection).
+
+    Args:
+        A: Input activations, float16, shape (M, K). Pre-Hadamard-transformed.
+        B_stacked: Stacked expert weights, int16, shape (E, tiles_k, tiles_n, wpt).
+        sorted_token_ids: (EM,) int32 — token indices sorted by expert.
+        expert_ids: (num_m_blocks,) int32 — expert ID per M-block.
+        num_tokens_post_padded: Total entries in sorted_token_ids (EM).
+        svh_stacked: (E, N) fp16 — per-expert SVH sign-flip vectors.
+        EM_max: Fixed upper bound for output tensor rows and grid dims.
+        bits: Bits per weight (1-8).
+        cb: Codebook variant (0, 1, 2).
+        num_valid_tokens: Number of real tokens (for bounds). Defaults to M.
+        split_k: Split-K factor. 0 = auto-select.
+        B_i32: Optional pre-computed int32 view of B_stacked.
+
+    Returns:
+        C: Output, float16, shape (EM_max, N) or (EM, N).
+    """
+    assert A.dtype == torch.float16
+    assert A.is_contiguous()
+    assert 1 <= bits <= 8
+    assert cb in (0, 1, 2)
+
+    M, K = A.shape
+    E = B_stacked.shape[0]
+    tiles_k, tiles_n = B_stacked.shape[1], B_stacked.shape[2]
+    N = tiles_n * 16
+    BLOCK_M = 16
+    WORDS_PER_TILE = 8 * bits
+
+    if num_valid_tokens is None:
+        num_valid_tokens = M
+
+    # Fallback: if N not divisible by 128, use separate GEMM + Had
+    if N % 128 != 0:
+        C = exl3_fused_moe_gemm(
+            A, B_stacked, sorted_token_ids, expert_ids,
+            num_tokens_post_padded, EM_max=EM_max, bits=bits, cb=cb,
+            num_valid_tokens=num_valid_tokens, split_k=split_k, B_i32=B_i32,
+        )
+        # Apply per-expert SVH manually (fallback for non-128-aligned dims)
+        if svh_stacked is not None:
+            # Need to gather per-token SVH from expert IDs
+            num_m_blocks = C.shape[0] // BLOCK_M
+            eid_per_token = expert_ids[:num_m_blocks].repeat_interleave(
+                BLOCK_M).clamp(min=0)
+            svh_per_token = svh_stacked[eid_per_token]
+            from vllm.model_executor.layers.quantization.exl3_kernels.hadamard import (
+                _get_had128,
+            )
+            H = _get_had128(C.device)
+            result = torch.mm(C.reshape(-1, 128), H.T)
+            result = result.reshape_as(C)
+            C = result * svh_per_token
+        return C
+
+    # Handle num_tokens_post_padded as int or tensor
+    if isinstance(num_tokens_post_padded, torch.Tensor):
+        num_post_pad_tensor = num_tokens_post_padded.to(torch.int32)
+        if EM_max <= 0:
+            EM_max = num_tokens_post_padded.item()
+    else:
+        if EM_max <= 0:
+            EM_max = num_tokens_post_padded
+        num_post_pad_tensor = torch.tensor(
+            [num_tokens_post_padded], dtype=torch.int32, device=A.device)
+
+    EM = EM_max
+    num_m_blocks = triton.cdiv(EM, BLOCK_M)
+    tiles_n128 = N // 128
+
+    if B_i32 is None:
+        B_i32 = B_stacked.view(torch.int32)
+
+    word_idx_t, next_word_idx_t, shift_t = get_bit_tables(bits, A.device)
+    H16 = _get_h16(A.device)
+
+    stride_be = B_i32.stride(0)
+    stride_svh_e = svh_stacked.stride(0)
+    HAS_SVH = svh_stacked is not None
+
+    # Auto-select split-K config
+    if split_k == 0:
+        if _AUTOTUNE_DISABLED:
+            config = _heuristic_config(1, tiles_k, tiles_n)
+        else:
+            device_name = torch.cuda.get_device_name(A.device)
+            cache_key = (1, K, N, bits, cb, device_name)
+            cached = _moe_had_tune_cache.get(cache_key)
+            if cached is not None:
+                config = cached
+            else:
+                # Use the standard MoE tune cache as starting point
+                cached = _tune_cache.get(cache_key)
+                if cached is not None:
+                    config = cached
+                else:
+                    config = autotune_splitk(1, K, N, bits, cb, A.device)
+                _moe_had_tune_cache[cache_key] = config
+                _save_moe_had_to_disk_cache(cache_key, config)
+        split_k, num_warps, num_stages, _ = config
+    else:
+        num_warps, num_stages = 2, 2
+
+    C = torch.zeros(EM, N, dtype=torch.float16, device=A.device)
+
+    if split_k > 1:
+        # Split-K path: reuse existing splitk GEMM kernel + new reduce+Had kernel
+        tiles_per_split = triton.cdiv(tiles_k, split_k)
+        partial_buf = _get_moe_splitk_buf(split_k, EM, N, A.device)
+        C_partial = partial_buf[:split_k, :EM, :N]
+        C_partial.zero_()  # Must zero: kernel skips remote expert blocks
+
+        # Phase 1: partial GEMM sums (reuse existing split-K kernel)
+        grid_sk = (num_m_blocks, tiles_n, split_k)
+        _exl3_fused_moe_gemm_splitk_kernel[grid_sk](
+            A, B_i32, C_partial,
+            sorted_token_ids, expert_ids,
+            num_post_pad_tensor,
+            word_idx_t, next_word_idx_t, shift_t,
+            num_valid_tokens, N, K,
+            A.stride(0), A.stride(1),
+            C_partial.stride(0), C_partial.stride(1), C_partial.stride(2),
+            stride_be,
+            tiles_n, tiles_per_split,
+            BLOCK_M=BLOCK_M, WORDS_PER_TILE=WORDS_PER_TILE, CB=cb,
+            SPLIT_K=split_k,
+            num_warps=num_warps, num_stages=num_stages,
+        )
+
+        # Phase 2: reduce + Had + SVH
+        grid_red = (num_m_blocks, tiles_n128)
+        _moe_reduce_had128_kernel[grid_red](
+            C_partial, C,
+            sorted_token_ids, expert_ids,
+            num_post_pad_tensor,
+            H16, svh_stacked,
+            num_valid_tokens, N, EM,
+            C_partial.stride(0), C_partial.stride(1), C_partial.stride(2),
+            C.stride(0), C.stride(1),
+            stride_svh_e,
+            H16.stride(0), H16.stride(1),
+            BLOCK_M=BLOCK_M, SPLIT_K=split_k, HAS_SVH=HAS_SVH,
+            num_warps=num_warps, num_stages=num_stages,
+        )
+
+    else:
+        # Non-split-K path: single fused kernel
+        grid = (num_m_blocks, tiles_n128)
+        _exl3_fused_moe_gemm_had128_kernel[grid](
+            A, B_i32, C,
+            sorted_token_ids, expert_ids,
+            num_post_pad_tensor,
+            word_idx_t, next_word_idx_t, shift_t,
+            H16, svh_stacked,
+            num_valid_tokens, N, K,
+            A.stride(0), A.stride(1),
+            C.stride(0), C.stride(1),
+            stride_be,
+            stride_svh_e,
+            H16.stride(0), H16.stride(1),
+            tiles_n,
+            BLOCK_M=BLOCK_M, WORDS_PER_TILE=WORDS_PER_TILE, CB=cb,
+            HAS_SVH=HAS_SVH,
             num_warps=num_warps, num_stages=num_stages,
         )
 

@@ -15,6 +15,7 @@ separately with its own input Hadamard transform.
 """
 
 from typing import TYPE_CHECKING, Any, Union
+import os
 
 import torch
 import torch.nn.functional as F
@@ -41,6 +42,25 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
+
+# Env var to enable fused MoE GEMM+Had (disabled by default — regresses
+# on RDNA3 due to VGPR spilling from 8-accumulator Had epilogue).
+# Superseded by V7 compound op (EXL3_MOE_COMPOUND). Kept for testing.
+_USE_FUSED_MOE_HAD = os.environ.get("EXL3_MOE_FUSED_HAD", "0") == "1"
+
+# Env var to enable FP16 expert weight cache: dequant MoE experts at load
+# time → use FP16 GEMM kernel (no trellis decode per K-tile).
+# Cost: ~288MB/GPU extra. Default ON for EP configurations.
+_USE_FP16_EXPERTS = os.environ.get("EXL3_FP16_EXPERTS", "0") == "1"
+
+# Env var to enable fused gate+up compound op (1 graph node instead of 7).
+# Default ON — reduces CUDA graph dispatch overhead.
+_USE_FUSED_GATE_UP = os.environ.get("EXL3_FUSED_GATE_UP", "1") == "1"
+
+# V7: Compound Had→GEMM→Had op (1 graph node per projection, 3 GPU kernels).
+# Back-to-back kernel launching — 4 graph nodes per MoE layer instead of 10.
+# Default ON — supersedes fused gate+up when enabled.
+_USE_MOE_COMPOUND = os.environ.get("EXL3_MOE_COMPOUND", "1") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +447,34 @@ class EXL3LinearMethod(LinearMethodBase):
             input_size_per_partition % 128 != 0
             or any(s % 128 != 0 for s in output_partition_sizes)
         )
+
+        # Performance-based dequant: for shapes where Triton kernel launch
+        # overhead (~70µs) dominates, rocBLAS FP16 via F.linear is faster.
+        # Threshold: K*N < 8M elements (~lm_head is 78M, stays EXL3).
+        _ROCBLAS_DEQUANT_THRESHOLD = int(os.environ.get(
+            "EXL3_DEQUANT_THRESHOLD", "8000000"))
+        if (not had_incompatible
+                and _ROCBLAS_DEQUANT_THRESHOLD > 0
+                and input_size_per_partition * output_size_per_partition
+                    < _ROCBLAS_DEQUANT_THRESHOLD):
+            # Skip for GQA layers where K/V heads are replicated across
+            # TP ranks — _create_weights_dequant computes full sizes as
+            # per_rank * TP, which overcounts replicated KV shards
+            # (checkpoint K SVH is 512 but full_sizes says 1024).
+            has_kv_replication = (
+                getattr(layer, 'num_kv_head_replicas', 1) > 1
+            )
+            if not has_kv_replication:
+                logger.info(
+                    "EXL3: dequant %s (%d×%d = %dK < %dM threshold)"
+                    " to FP16 for rocBLAS",
+                    layer.__class__.__name__,
+                    input_size_per_partition, output_size_per_partition,
+                    input_size_per_partition * output_size_per_partition
+                    // 1024,
+                    _ROCBLAS_DEQUANT_THRESHOLD // 1_000_000,
+                )
+                had_incompatible = True
 
         if had_incompatible:
             self._create_weights_dequant(
@@ -1216,6 +1264,59 @@ def _load_moe_svh(
         param.data[expert_id].copy_(loaded_weight)
 
 
+def _dequant_expert_weights(trellis, trellis_i32, suh, svh, K, N, bits):
+    """Dequant all experts: trellis → (E, K, N) FP16 via identity-matrix pipeline.
+
+    Args:
+        trellis: (E, tiles_k, tiles_n, wpt) int16
+        trellis_i32: (E, tiles_k, tiles_n, wpt//2) int32 view
+        suh: (E, K) fp16 — input Hadamard scale per expert
+        svh: (E, N) fp16 — output Hadamard scale per expert
+        K: input dimension
+        N: output dimension
+        bits: quantization bits
+
+    Returns:
+        (E, K, N) fp16 row-major weight tensor
+    """
+    from vllm.model_executor.layers.quantization.exl3_kernels import (
+        exl3_gemm,
+        had_r_128,
+    )
+
+    E = trellis.shape[0]
+    device = trellis.device
+    BLOCK = 128
+
+    experts_fp16 = []
+    for e in range(E):
+        rows = []
+        for start in range(0, K, BLOCK):
+            bs = min(BLOCK, K - start)
+            eye = torch.zeros(bs, K, dtype=torch.float16, device=device)
+            eye[:, start:start + bs] = torch.eye(
+                bs, dtype=torch.float16, device=device)
+
+            # Input Hadamard
+            xh = torch.empty_like(eye)
+            had_r_128(eye, xh, suh[e], None, 1.0)
+
+            # GEMM
+            proj = exl3_gemm(
+                xh, trellis[e], bits=bits, cb=0,
+                B_i32=trellis_i32[e],
+            )
+
+            # Output Hadamard
+            proj_h = torch.empty_like(proj)
+            had_r_128(proj, proj_h, None, svh[e], 1.0)
+
+            rows.append(proj_h)
+        experts_fp16.append(torch.cat(rows, dim=0))
+
+    return torch.stack(experts_fp16, dim=0)  # (E, K, N)
+
+
 class EXL3FusedMoEMethod(FusedMoEMethodBase):
     """FusedMoE method for EXL3 trellis-coded quantization.
 
@@ -1399,6 +1500,16 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         )
         del layer.w13_svh
 
+        # V5: Pre-split w13_suh gate/up slices to contiguous for dual Had.
+        # w13_suh is (E, 2, dim) — [:, 0, :] has stride (2*dim, 1), not
+        # contiguous. Pre-materializing avoids .contiguous() per forward.
+        layer.w13_suh_gate = torch.nn.Parameter(
+            layer.w13_suh.data[:, 0, :].contiguous(), requires_grad=False,
+        )
+        layer.w13_suh_up = torch.nn.Parameter(
+            layer.w13_suh.data[:, 1, :].contiguous(), requires_grad=False,
+        )
+
         # Eagerly populate device-side caches
         device = layer.w1_trellis.data.device
         from vllm.model_executor.layers.quantization.exl3_kernels.hadamard import (
@@ -1438,6 +1549,117 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         dummy_down = torch.zeros(1, K, dtype=torch.float16, device=device)
         had_r_128(dummy_down, torch.empty_like(dummy_down),
                   None, layer.w2_svh[0], 1.0)
+
+        # --- FP16 expert dequant (Phase 4) ---
+        # Dequant MoE expert weights to FP16 at load time for FP16 GEMM kernel.
+        # Uses the same identity-matrix pipeline as the dense dequant path.
+        if _USE_FP16_EXPERTS:
+            K = layer.w13_suh.shape[-1]     # hidden_size
+            N_gate = layer.w1_svh.shape[-1]  # intermediate_size_per_partition
+
+            logger.info(
+                "EXL3: dequanting MoE experts to FP16 "
+                "(E=%d, gate/up %dx%d, down %dx%d)",
+                layer.w1_trellis.shape[0], K, N_gate, N_gate, K)
+
+            # Gate: (E, K) -> (E, K, N_gate)
+            layer.w1_fp16 = torch.nn.Parameter(
+                _dequant_expert_weights(
+                    layer.w1_trellis, layer.w1_trellis_i32,
+                    layer.w13_suh[:, 0, :], layer.w1_svh,
+                    K, N_gate, bits,
+                ),
+                requires_grad=False,
+            )
+            # Up: (E, K) -> (E, K, N_gate)
+            layer.w3_fp16 = torch.nn.Parameter(
+                _dequant_expert_weights(
+                    layer.w3_trellis, layer.w3_trellis_i32,
+                    layer.w13_suh[:, 1, :], layer.w3_svh,
+                    K, N_gate, bits,
+                ),
+                requires_grad=False,
+            )
+            # Down: (E, N_gate) -> (E, N_gate, K)
+            layer.w2_fp16 = torch.nn.Parameter(
+                _dequant_expert_weights(
+                    layer.w2_trellis, layer.w2_trellis_i32,
+                    layer.w2_suh, layer.w2_svh,
+                    N_gate, K, bits,
+                ),
+                requires_grad=False,
+            )
+
+            fp16_bytes = (
+                layer.w1_fp16.numel() + layer.w3_fp16.numel()
+                + layer.w2_fp16.numel()
+            ) * 2
+            logger.info(
+                "EXL3: FP16 expert cache: %.1f MB/layer on %s",
+                fp16_bytes / 1024 / 1024, device)
+
+        # Warmup HIP rocWMMA fused MoE GEMM kernel (Phase 3)
+        try:
+            from vllm.model_executor.layers.quantization.exl3_kernels import (
+                _HAS_HIP_MOE,
+            )
+            if _HAS_HIP_MOE:
+                from vllm.model_executor.layers.quantization.exl3_kernels import (
+                    _get_hip_moe_splitk_buf,
+                    _hip_moe_auto_split_k,
+                )
+                # Pre-allocate split-K buffers for decode shapes
+                BLOCK_M = 16
+                top_k = 10  # Qwen3-Next default
+                EM_warmup = top_k * BLOCK_M
+                num_m_blocks_warmup = EM_warmup // BLOCK_M
+                # Gate/Up shape
+                tiles_k_gu = K // 16
+                sk_gu = _hip_moe_auto_split_k(num_m_blocks_warmup, tiles_k_gu)
+                if sk_gu > 1:
+                    _get_hip_moe_splitk_buf(sk_gu, EM_warmup, N, device)
+                # Down shape
+                tiles_k_dn = N // 16
+                sk_dn = _hip_moe_auto_split_k(num_m_blocks_warmup, tiles_k_dn)
+                if sk_dn > 1:
+                    _get_hip_moe_splitk_buf(sk_dn, EM_warmup, K, device)
+                logger.info(
+                    "EXL3 HIP MoE warmup: gate/up sk=%d, down sk=%d, EM=%d",
+                    sk_gu, sk_dn, EM_warmup)
+        except ImportError:
+            pass
+
+        # Warmup fused MoE GEMM+Had kernels (pre-compile + auto-tune)
+        if _USE_FUSED_MOE_HAD:
+            from vllm.model_executor.layers.quantization.exl3_kernels.triton_kernel import (
+                _get_h16,
+                exl3_fused_moe_gemm_had as _fused_moe_had_impl,
+            )
+            _get_h16(device)
+            # Build minimal MoE-shaped inputs for one expert
+            BLOCK_M = 16
+            EM_warmup = BLOCK_M  # 1 block
+            dummy_sorted = torch.arange(
+                EM_warmup, device=device, dtype=torch.int32)
+            dummy_eid = torch.zeros(1, device=device, dtype=torch.int32)
+            dummy_npp = torch.tensor(
+                [EM_warmup], device=device, dtype=torch.int32)
+            # Gate/Up: (1, K) -> (EM, N_gate)
+            dummy_a_k = torch.zeros(
+                EM_warmup, K, dtype=torch.float16, device=device)
+            _fused_moe_had_impl(
+                dummy_a_k, layer.w1_trellis,
+                dummy_sorted, dummy_eid, dummy_npp,
+                layer.w1_svh, EM_max=EM_warmup, bits=bits, cb=0,
+                B_i32=layer.w1_trellis_i32)
+            # Down: (1, N) -> (EM, K_out)
+            dummy_a_n = torch.zeros(
+                EM_warmup, N, dtype=torch.float16, device=device)
+            _fused_moe_had_impl(
+                dummy_a_n, layer.w2_trellis,
+                dummy_sorted, dummy_eid, dummy_npp,
+                layer.w2_svh, EM_max=EM_warmup, bits=bits, cb=0,
+                B_i32=layer.w2_trellis_i32)
 
     def get_fused_moe_quant_config(self, layer):
         return None
@@ -1540,6 +1762,8 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         from vllm.model_executor.layers.quantization.exl3_kernels import (
             batched_had_r_128,
             exl3_fused_moe_gemm,
+            exl3_fused_moe_gemm_had,
+            exl3_moe_had_gemm_had,
         )
 
         bits = layer.exl3_bits
@@ -1565,17 +1789,27 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         # (EM_max, total, N_out). num_post_pad_t stays as tensor — kernel
         # loads it for runtime bounds checking. No .item(), no
         # GPU-data-dependent branches.
-        EM_max = top_k * BLOCK_M   # Fixed Python int — tight decode bound
 
         x_expanded = x.unsqueeze(1).expand(
             -1, top_k, -1).reshape(total, K)
 
         sorted_token_ids, expert_ids, num_post_pad_t = \
             moe_align_block_size(
-                topk_ids, BLOCK_M, global_num_experts, expert_map)
+                topk_ids, BLOCK_M, global_num_experts, expert_map,
+                pad_sorted_ids=True)
 
-        # Gather: fixed-size EM_max rows (no .item() needed)
-        num_m_blocks = EM_max // BLOCK_M  # = top_k, Python int
+        if M == 1:
+            # Decode: tight fixed bound for graph capture compatibility
+            EM_max = top_k * BLOCK_M
+        else:
+            # Prefill/warmup: use sorted_token_ids tensor size as upper bound.
+            # This is a Python int (tensor shape) — no .item() needed, so it's
+            # safe during CUDA graph capture. The kernel skips excess blocks
+            # via the num_tokens_post_padded runtime check.
+            EM_max = sorted_token_ids.shape[0]
+
+        # Gather: fixed-size EM_max rows (no .item() needed for decode)
+        num_m_blocks = EM_max // BLOCK_M
         tid_clamped = sorted_token_ids[:EM_max].clamp(
             max=total - 1).long()
         x_sorted = x_expanded[tid_clamped]
@@ -1587,46 +1821,145 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         identity_ids = torch.arange(
             EM_max, device=x.device, dtype=sorted_token_ids.dtype)
 
-        # Gate projection: Had → GEMM → Had
-        xh_gate = batched_had_r_128(
-            x_sorted, layer.w13_suh[:, 0, :],
-            eid_per_token, pre=True)
-        gate = exl3_fused_moe_gemm(
-            xh_gate, layer.w1_trellis,
-            identity_ids, eid_blocks,
-            num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
-            B_i32=layer.w1_trellis_i32)
-        gate_h = batched_had_r_128(
-            gate, layer.w1_svh,
-            eid_per_token, pre=False)
+        # Get FP16 expert weights if available (Phase 4)
+        w1_fp16 = getattr(layer, 'w1_fp16', None)
+        w3_fp16 = getattr(layer, 'w3_fp16', None)
+        w2_fp16 = getattr(layer, 'w2_fp16', None)
 
-        # Up projection: Had → GEMM → Had
-        xh_up = batched_had_r_128(
-            x_sorted, layer.w13_suh[:, 1, :],
-            eid_per_token, pre=True)
-        up = exl3_fused_moe_gemm(
-            xh_up, layer.w3_trellis,
-            identity_ids, eid_blocks,
-            num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
-            B_i32=layer.w3_trellis_i32)
-        up_h = batched_had_r_128(
-            up, layer.w3_svh,
-            eid_per_token, pre=False)
+        # When FP16 experts are available, the had→gemm→had pipeline is
+        # baked into the FP16 weights — no separate Had transforms needed.
+        # Just do: x_sorted @ W_fp16 (via FP16 MoE GEMM kernel).
+        if w1_fp16 is not None:
+            # FP16 path: skip Had transforms, use pre-dequanted weights
+            gate_h = exl3_fused_moe_gemm(
+                x_sorted, layer.w1_trellis,
+                identity_ids, eid_blocks,
+                num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
+                B_i32=layer.w1_trellis_i32,
+                B_fp16=w1_fp16)
 
-        hidden = F.silu(gate_h) * up_h
+            up_h = exl3_fused_moe_gemm(
+                x_sorted, layer.w3_trellis,
+                identity_ids, eid_blocks,
+                num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
+                B_i32=layer.w3_trellis_i32,
+                B_fp16=w3_fp16)
 
-        # Down projection: Had → GEMM → Had
-        xh_down = batched_had_r_128(
-            hidden, layer.w2_suh,
-            eid_per_token, pre=True)
-        down = exl3_fused_moe_gemm(
-            xh_down, layer.w2_trellis,
-            identity_ids, eid_blocks,
-            num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
-            B_i32=layer.w2_trellis_i32)
-        down_h = batched_had_r_128(
-            down, layer.w2_svh,
-            eid_per_token, pre=False)
+            hidden = F.silu(gate_h) * up_h
+
+            down_h = exl3_fused_moe_gemm(
+                hidden, layer.w2_trellis,
+                identity_ids, eid_blocks,
+                num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
+                B_i32=layer.w2_trellis_i32,
+                B_fp16=w2_fp16)
+        elif _USE_MOE_COMPOUND:
+            # V7: Compound Had→GEMM→Had (4 graph nodes per layer)
+            # Each compound op = 1 graph node launching 3 GPU kernels
+            # back-to-back on the HIP stream.
+
+            # Gate projection: Had_in → GEMM → Had_out [1 node]
+            gate_h = exl3_moe_had_gemm_had(
+                x_sorted, layer.w13_suh_gate,
+                layer.w1_trellis, layer.w1_svh,
+                eid_per_token, eid_blocks,
+                num_post_pad_t, EM_max=EM_max, bits=bits,
+                B_i32=layer.w1_trellis_i32)
+
+            # Up projection: Had_in → GEMM → Had_out [1 node]
+            up_h = exl3_moe_had_gemm_had(
+                x_sorted, layer.w13_suh_up,
+                layer.w3_trellis, layer.w3_svh,
+                eid_per_token, eid_blocks,
+                num_post_pad_t, EM_max=EM_max, bits=bits,
+                B_i32=layer.w3_trellis_i32)
+
+            # SiLU(gate) * up [1 node]
+            hidden = F.silu(gate_h) * up_h
+
+            # Down projection: Had_in → GEMM → Had_out [1 node]
+            down_h = exl3_moe_had_gemm_had(
+                hidden, layer.w2_suh,
+                layer.w2_trellis, layer.w2_svh,
+                eid_per_token, eid_blocks,
+                num_post_pad_t, EM_max=EM_max, bits=bits,
+                B_i32=layer.w2_trellis_i32)
+        else:
+            # Legacy path: separate Had + GEMM ops (10 graph nodes per layer)
+            # V5: Dual Had for gate+up input (1 kernel instead of 2)
+            # Uses pre-split contiguous suh slices (no .contiguous() per call)
+            if _USE_FUSED_GATE_UP and not _USE_FUSED_MOE_HAD:
+                xh_gate, xh_up = torch.ops.vllm.batched_dual_had_r_128(
+                    x_sorted,
+                    layer.w13_suh_gate,
+                    layer.w13_suh_up,
+                    eid_per_token, 1)  # pre=True
+            else:
+                xh_gate = batched_had_r_128(
+                    x_sorted, layer.w13_suh_gate,
+                    eid_per_token, pre=True)
+                xh_up = batched_had_r_128(
+                    x_sorted, layer.w13_suh_up,
+                    eid_per_token, pre=True)
+
+            # Gate projection: GEMM(+Had)
+            if _USE_FUSED_MOE_HAD:
+                gate_h = exl3_fused_moe_gemm_had(
+                    xh_gate, layer.w1_trellis,
+                    identity_ids, eid_blocks,
+                    num_post_pad_t, layer.w1_svh,
+                    EM_max=EM_max, bits=bits, cb=0,
+                    B_i32=layer.w1_trellis_i32)
+            else:
+                gate = exl3_fused_moe_gemm(
+                    xh_gate, layer.w1_trellis,
+                    identity_ids, eid_blocks,
+                    num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
+                    B_i32=layer.w1_trellis_i32)
+                gate_h = batched_had_r_128(
+                    gate, layer.w1_svh,
+                    eid_per_token, pre=False)
+
+            # Up projection: GEMM(+Had)
+            if _USE_FUSED_MOE_HAD:
+                up_h = exl3_fused_moe_gemm_had(
+                    xh_up, layer.w3_trellis,
+                    identity_ids, eid_blocks,
+                    num_post_pad_t, layer.w3_svh,
+                    EM_max=EM_max, bits=bits, cb=0,
+                    B_i32=layer.w3_trellis_i32)
+            else:
+                up = exl3_fused_moe_gemm(
+                    xh_up, layer.w3_trellis,
+                    identity_ids, eid_blocks,
+                    num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
+                    B_i32=layer.w3_trellis_i32)
+                up_h = batched_had_r_128(
+                    up, layer.w3_svh,
+                    eid_per_token, pre=False)
+
+            hidden = F.silu(gate_h) * up_h
+
+            # Down projection: Had → GEMM(+Had)
+            xh_down = batched_had_r_128(
+                hidden, layer.w2_suh,
+                eid_per_token, pre=True)
+            if _USE_FUSED_MOE_HAD:
+                down_h = exl3_fused_moe_gemm_had(
+                    xh_down, layer.w2_trellis,
+                    identity_ids, eid_blocks,
+                    num_post_pad_t, layer.w2_svh,
+                    EM_max=EM_max, bits=bits, cb=0,
+                    B_i32=layer.w2_trellis_i32)
+            else:
+                down = exl3_fused_moe_gemm(
+                    xh_down, layer.w2_trellis,
+                    identity_ids, eid_blocks,
+                    num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
+                    B_i32=layer.w2_trellis_i32)
+                down_h = batched_had_r_128(
+                    down, layer.w2_svh,
+                    eid_per_token, pre=False)
 
         # Scatter back to token order (padding → discard row)
         output_buf = torch.zeros(
