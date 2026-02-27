@@ -154,6 +154,61 @@ def _hip_moe_auto_split_k(num_m_blocks, num_k_tiles):
 
 
 # ---------------------------------------------------------------------------
+# HIP v2 dense GEMM: reuses MoE kernel with 1 expert for M=1 decode.
+# 4.4x faster than Triton dense GEMM (17µs vs 76µs).
+# Toggle: EXL3_HIP_DENSE_GEMM=1 (default ON when HIP MoE available)
+# ---------------------------------------------------------------------------
+# Default OFF: only 5µs/kernel faster in CUDA graph replay (28.8→23.7µs),
+# total savings ~0.6ms/step — not worth the code complexity.
+_USE_HIP_DENSE_GEMM = os.environ.get("EXL3_HIP_DENSE_GEMM", "0") == "1"
+
+# Cached routing tensors for dense GEMM (single M-block, expert 0)
+_hip_dense_routing: dict = {}  # {device: (expert_ids, num_tokens_post_padded)}
+
+BLOCK_M_DENSE = 16
+
+
+def _get_hip_dense_routing(device):
+    """Get cached single-expert routing tensors for HIP v2 dense GEMM."""
+    r = _hip_dense_routing.get(device)
+    if r is None:
+        expert_ids = torch.zeros(1, dtype=torch.int32, device=device)
+        num_post = torch.tensor([BLOCK_M_DENSE], dtype=torch.int32, device=device)
+        r = (expert_ids, num_post)
+        _hip_dense_routing[device] = r
+    return r
+
+
+# Cached padded input buffer for dense GEMM: {(device, K): tensor}
+_hip_dense_input_buf: dict = {}
+
+
+def _get_hip_dense_input_buf(K, device):
+    """Get cached BLOCK_M×K padded input buffer for HIP v2 dense GEMM."""
+    key = (device, K)
+    buf = _hip_dense_input_buf.get(key)
+    if buf is None:
+        buf = torch.zeros(BLOCK_M_DENSE, K, dtype=torch.float16, device=device)
+        _hip_dense_input_buf[key] = buf
+    return buf
+
+
+# Cached split-K partial buffer for dense GEMM: {(device, split_k, N): tensor}
+_hip_dense_splitk_buf: dict = {}
+
+
+def _get_hip_dense_splitk_buf(split_k, N, device):
+    """Get or allocate cached C_partial for HIP v2 dense split-K."""
+    key = (device, split_k, N)
+    buf = _hip_dense_splitk_buf.get(key)
+    if buf is None:
+        buf = torch.empty(
+            (split_k, BLOCK_M_DENSE, N), dtype=torch.float16, device=device)
+        _hip_dense_splitk_buf[key] = buf
+    return buf
+
+
+# ---------------------------------------------------------------------------
 # Register exl3_gemm as a custom op for torch.compile compatibility.
 # ---------------------------------------------------------------------------
 
@@ -165,10 +220,47 @@ def _exl3_gemm_op(
     cb: int,
 ) -> torch.Tensor:
     """Wrapper matching custom_op signature (no optional args)."""
-    # v3 pipelined HIP kernel: 4-wave (N=64 per block), lock-based split-K
+    M, K = A.shape
     N = B_packed.shape[1] * 16
+
+    # HIP v2 dense GEMM: reuse MoE kernel with 1 expert, BLOCK_M=16
+    # Only for M=1 decode (most common case) and cb=0
+    if (_USE_HIP_DENSE_GEMM and _HAS_HIP_MOE and M == 1 and cb == 0
+            and K % 16 == 0 and N % 16 == 0):
+        word_idx, next_word_idx, shift_tbl = get_bit_tables(bits, A.device)
+        expert_ids, num_post = _get_hip_dense_routing(A.device)
+
+        # Pad input from (1, K) to (BLOCK_M, K) — kernel expects BLOCK_M rows
+        A_padded = _get_hip_dense_input_buf(K, A.device)
+        A_padded[0].copy_(A[0])
+
+        # Reshape B from (tiles_k, tiles_n, WPT) to (1, tiles_k, tiles_n, WPT)
+        B_e = B_i32.unsqueeze(0)
+
+        num_k_tiles = K // 16
+        split_k = _hip_moe_auto_split_k(1, num_k_tiles)
+        split_k = min(split_k, num_k_tiles)
+
+        C = _get_hip_moe_output_buf(BLOCK_M_DENSE, N, A.device)
+
+        if split_k > 1:
+            # Dedicated small buffer — MoE buffers may have larger EM_max
+            # which makes slices non-contiguous
+            C_partial = _get_hip_dense_splitk_buf(split_k, N, A.device)
+        else:
+            C_partial = torch.empty(
+                1, 1, 1, dtype=torch.float16, device=A.device)
+
+        _hip_ext.exl3_fused_moe_gemm(
+            A_padded, B_e, C,
+            expert_ids, num_post,
+            word_idx, next_word_idx, shift_tbl,
+            BLOCK_M_DENSE, bits, 0, split_k, C_partial,
+        )
+        return C[:1]  # Return only first row
+
+    # v3 pipelined HIP kernel: 4-wave (N=64 per block), lock-based split-K
     if _HAS_HIP_V3 and N % 64 == 0 and cb == 0:
-        M, K = A.shape
         C = torch.empty(M, N, dtype=torch.float16, device=A.device)
         word_idx, next_word_idx, shift_tbl = get_bit_tables(bits, A.device)
 
