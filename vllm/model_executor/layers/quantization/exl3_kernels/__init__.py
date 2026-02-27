@@ -1206,63 +1206,59 @@ def _exl3_moe_had_gemm_had_v2_op(
     num_tokens_post_padded: torch.Tensor,
     buf_xh: torch.Tensor,            # scratch: (EM_max, K_in) — mutated
     buf_C: torch.Tensor,             # scratch: (EM_max, N_out) — mutated
+    buf_C_partial: torch.Tensor,     # scratch: (split_k, EM_max, N_out) — mutated
     output: torch.Tensor,            # result: (EM_max, N_out) — mutated
     EM_max: int,
     N_out: int,
     bits: int,
+    split_k: int,
 ) -> None:
     """V2 compound op: Had_in → GEMM → Had_out, zero internal allocations.
 
     All scratch buffers are passed in and mutated in-place.
-    Launches 3 GPU kernels back-to-back on the HIP stream.
+    Launches 3 GPU kernels (+ 1 reduce if split_k > 1) back-to-back.
     """
-    M = x_sorted.size(0)
-    eid_len = eid_per_token.size(0)
-
-    if _HAS_HIP_BATCHED_HAD and eid_len == M:
-        # --- HIP fast path: direct _hip_ext calls, no framework dispatch ---
-        eid_int = eid_per_token.int()
+    if _HAS_HIP_BATCHED_HAD and _HAS_HIP_MOE:
+        # --- HIP fast path: direct kernel calls, no Python dispatch ---
+        word_idx, next_word_idx, shift_tbl = get_bit_tables(
+            bits, x_sorted.device)
 
         # 1. Input Hadamard: x_sorted → buf_xh
         _hip_ext.batched_had_r_128(
             x_sorted, suh_stacked, buf_xh,
-            eid_int, 1)  # pre=True
+            eid_per_token, 1)  # pre=True
 
-        # 2. GEMM: buf_xh → buf_C (reuses existing HIP helper with cached bufs)
-        C_result = _exl3_fused_moe_gemm_hip(
-            buf_xh, B_stacked_i32, eid_blocks,
-            num_tokens_post_padded, EM_max, bits)
-        # Copy into buf_C if _exl3_fused_moe_gemm_hip returned a different buffer
-        if C_result.data_ptr() != buf_C.data_ptr():
-            buf_C[:C_result.shape[0], :C_result.shape[1]].copy_(C_result)
+        # 2. GEMM: buf_xh → buf_C (direct kernel call, no wrapper allocation)
+        _hip_ext.exl3_fused_moe_gemm(
+            buf_xh, B_stacked_i32, buf_C,
+            eid_blocks, num_tokens_post_padded,
+            word_idx, next_word_idx, shift_tbl,
+            EM_max, bits, 0,  # cb=0
+            split_k, buf_C_partial,
+        )
 
         # 3. Output Hadamard: buf_C → output
         _hip_ext.batched_had_r_128(
             buf_C, svh_stacked, output,
-            eid_int, 0)  # pre=False (post-scale)
+            eid_per_token, 0)  # pre=False (post-scale)
         return
 
-    # --- Fallback: dispatch through torch.ops.vllm (Triton or HIP GEMM) ---
-    identity_ids = torch.arange(
-        M, device=x_sorted.device, dtype=torch.int32)
+    # --- Fallback: Triton path ---
+    M = x_sorted.size(0)
     eid_sliced = eid_per_token[:M]
 
     # 1. Input Hadamard
-    xh = torch.ops.vllm.batched_had_r_128(
-        x_sorted, suh_stacked, eid_sliced, 1)
+    xh = _batched_had_r_128_triton(x_sorted, suh_stacked, eid_sliced, True)
     buf_xh.copy_(xh)
 
-    # 2. GEMM
-    C = torch.ops.vllm.exl3_fused_moe_gemm(
-        buf_xh, B_stacked_i32, identity_ids, eid_blocks,
-        num_tokens_post_padded,
-        torch.empty(0, dtype=torch.float16, device=x_sorted.device),
-        EM_max, N_out, bits, 0)
+    # 2. GEMM (use Triton fused MoE)
+    C = _exl3_fused_moe_gemm_impl(
+        buf_xh, B_stacked_i32.view(torch.float16),
+        eid_blocks, num_tokens_post_padded, EM_max, bits)
     buf_C[:C.shape[0], :C.shape[1]].copy_(C)
 
     # 3. Output Hadamard
-    out = torch.ops.vllm.batched_had_r_128(
-        buf_C, svh_stacked, eid_sliced, 0)
+    out = _batched_had_r_128_triton(buf_C, svh_stacked, eid_sliced, False)
     output.copy_(out)
 
 
@@ -1276,10 +1272,12 @@ def _exl3_moe_had_gemm_had_v2_fake(
     num_tokens_post_padded: torch.Tensor,
     buf_xh: torch.Tensor,
     buf_C: torch.Tensor,
+    buf_C_partial: torch.Tensor,
     output: torch.Tensor,
     EM_max: int,
     N_out: int,
     bits: int,
+    split_k: int,
 ) -> None:
     """Fake impl for Dynamo — mutates output in-place, returns None."""
     # output is mutated in-place; Dynamo tracks via mutates_args
@@ -1289,7 +1287,7 @@ def _exl3_moe_had_gemm_had_v2_fake(
 direct_register_custom_op(
     op_name="exl3_moe_had_gemm_had_v2",
     op_func=_exl3_moe_had_gemm_had_v2_op,
-    mutates_args=["buf_xh", "buf_C", "output"],
+    mutates_args=["buf_xh", "buf_C", "buf_C_partial", "output"],
     fake_impl=_exl3_moe_had_gemm_had_v2_fake,
 )
 
@@ -1304,15 +1302,18 @@ def exl3_moe_had_gemm_had_v2(
     num_tokens_post_padded: "int | torch.Tensor",
     buf_xh: torch.Tensor,
     buf_C: torch.Tensor,
+    buf_C_partial: torch.Tensor,
     output: torch.Tensor,
     EM_max: int,
     bits: int = 4,
+    split_k: int = 0,
     B_i32: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """V2 compound Had→GEMM→Had: zero internal allocations.
 
-    All scratch buffers (buf_xh, buf_C, output) are caller-allocated and
-    passed in. Returns output (same tensor, mutated in-place).
+    All scratch buffers (buf_xh, buf_C, buf_C_partial, output) are
+    caller-allocated and passed in. Returns output (same tensor, mutated
+    in-place).
     """
     if B_i32 is None:
         B_i32 = B_stacked.view(torch.int32)
@@ -1328,8 +1329,8 @@ def exl3_moe_had_gemm_had_v2(
     torch.ops.vllm.exl3_moe_had_gemm_had_v2(
         x_sorted, suh_stacked, B_i32, svh_stacked,
         eid_per_token, eid_blocks,
-        num_post_pad_t, buf_xh, buf_C, output,
-        EM_max, N_out, bits,
+        num_post_pad_t, buf_xh, buf_C, buf_C_partial, output,
+        EM_max, N_out, bits, split_k,
     )
     return output
 

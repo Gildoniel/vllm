@@ -66,6 +66,10 @@ _USE_MOE_COMPOUND = os.environ.get("EXL3_MOE_COMPOUND", "0") == "1"
 # all scratch buffers allocated outside the opaque op (visible to torch.compile
 # memory planner → CUDA graph memory pool, not real cudaMalloc on replay).
 # Default ON when HIP batched Had is available.
+# Default OFF: V2 compound ops still regress 4.9 tok/s (26.9 vs 31.8).
+# The compound op wrapper adds more overhead than it saves in graph nodes.
+# CUDA graphs already capture the same kernel launches regardless of
+# whether they're grouped in 3 compound ops or 11 separate ops.
 _USE_MOE_COMPOUND_V2 = os.environ.get("EXL3_MOE_COMPOUND_V2", "0") == "1"
 
 # Prefill BLOCK_M=64: kernel-level dequant reuse for prefill.
@@ -1869,53 +1873,81 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         elif _USE_MOE_COMPOUND_V2:
             # V2: Zero-allocation compound Had→GEMM→Had.
             # 4 graph nodes per MoE layer (gate, up, silu_mul, down).
-            # All scratch buffers allocated here (visible to torch.compile
-            # memory planner) and passed into the opaque op via mutates_args.
+            # ALL buffers allocated here (visible to torch.compile memory
+            # planner → CUDA graph memory pool) and passed in via mutates_args.
             from vllm.model_executor.layers.quantization.exl3_kernels import (
-                _get_moe_scratch_buf,
+                _get_moe_scratch_buf, _hip_moe_auto_split_k,
             )
 
             N_inter = layer.w1_svh.shape[1]  # intermediate_size_per_partition
+            num_m_blocks = eid_blocks.shape[0]
+
+            # Compute split-K for gate/up (K_in=K → N=N_inter)
+            num_k_tiles_gu = K // 16
+            split_k_gu = _hip_moe_auto_split_k(num_m_blocks, num_k_tiles_gu)
+            split_k_gu = min(split_k_gu, num_k_tiles_gu)
+
+            # Compute split-K for down (K_in=N_inter → N=K)
+            num_k_tiles_dn = N_inter // 16
+            split_k_dn = _hip_moe_auto_split_k(num_m_blocks, num_k_tiles_dn)
+            split_k_dn = min(split_k_dn, num_k_tiles_dn)
 
             # Scratch buffers for gate/up (reusable — sequential, not concurrent)
             buf_xh_gu = _get_moe_scratch_buf("xh_gu", EM_max, K, x.device)
             buf_C_gu = _get_moe_scratch_buf("C_gu", EM_max, N_inter, x.device)
-            gate_out = _get_moe_scratch_buf("gate_out", EM_max, N_inter, x.device)
+            gate_out = _get_moe_scratch_buf("gate_out", EM_max, N_inter,
+                                            x.device)
+            if split_k_gu > 1:
+                buf_Cp_gu = _get_moe_scratch_buf(
+                    "Cp_gu", split_k_gu * EM_max, N_inter, x.device
+                ).view(split_k_gu, EM_max, N_inter)
+            else:
+                buf_Cp_gu = torch.empty(
+                    1, 1, 1, dtype=torch.float16, device=x.device)
 
             # Gate projection: Had→GEMM→Had
             exl3_moe_had_gemm_had_v2(
                 x_sorted, layer.w13_suh_gate,
                 layer.w1_trellis, layer.w1_svh,
                 eid_per_token, eid_blocks,
-                num_post_pad_t, buf_xh_gu, buf_C_gu, gate_out,
-                EM_max=EM_max, bits=bits,
+                num_post_pad_t, buf_xh_gu, buf_C_gu, buf_Cp_gu, gate_out,
+                EM_max=EM_max, bits=bits, split_k=split_k_gu,
                 B_i32=layer.w1_trellis_i32)
 
-            # Up projection: reuse buf_xh_gu, buf_C_gu (gate is done)
+            # Up projection: reuse buf_xh_gu, buf_C_gu, buf_Cp_gu (gate done)
             up_out = _get_moe_scratch_buf("up_out", EM_max, N_inter, x.device)
 
             exl3_moe_had_gemm_had_v2(
                 x_sorted, layer.w13_suh_up,
                 layer.w3_trellis, layer.w3_svh,
                 eid_per_token, eid_blocks,
-                num_post_pad_t, buf_xh_gu, buf_C_gu, up_out,
-                EM_max=EM_max, bits=bits,
+                num_post_pad_t, buf_xh_gu, buf_C_gu, buf_Cp_gu, up_out,
+                EM_max=EM_max, bits=bits, split_k=split_k_gu,
                 B_i32=layer.w3_trellis_i32)
 
             # Activation: silu(gate) * up
             hidden = F.silu(gate_out) * up_out
 
             # Down projection: different dimensions (N_inter → K)
-            buf_xh_dn = _get_moe_scratch_buf("xh_dn", EM_max, N_inter, x.device)
+            buf_xh_dn = _get_moe_scratch_buf("xh_dn", EM_max, N_inter,
+                                              x.device)
             buf_C_dn = _get_moe_scratch_buf("C_dn", EM_max, N_out, x.device)
-            down_out = _get_moe_scratch_buf("down_out", EM_max, N_out, x.device)
+            down_out = _get_moe_scratch_buf("down_out", EM_max, N_out,
+                                            x.device)
+            if split_k_dn > 1:
+                buf_Cp_dn = _get_moe_scratch_buf(
+                    "Cp_dn", split_k_dn * EM_max, N_out, x.device
+                ).view(split_k_dn, EM_max, N_out)
+            else:
+                buf_Cp_dn = torch.empty(
+                    1, 1, 1, dtype=torch.float16, device=x.device)
 
             exl3_moe_had_gemm_had_v2(
                 hidden, layer.w2_suh,
                 layer.w2_trellis, layer.w2_svh,
                 eid_per_token, eid_blocks,
-                num_post_pad_t, buf_xh_dn, buf_C_dn, down_out,
-                EM_max=EM_max, bits=bits,
+                num_post_pad_t, buf_xh_dn, buf_C_dn, buf_Cp_dn, down_out,
+                EM_max=EM_max, bits=bits, split_k=split_k_dn,
                 B_i32=layer.w2_trellis_i32)
 
             down_h = down_out
