@@ -2699,6 +2699,105 @@ def _moe_reduce_had128_kernel(
 
 
 # =============================================================================
+# Trellis → FP16 bulk dequant kernel (no GEMM, just decode packed bits)
+#
+# For prefill: dequant expert weights to FP16 scratch buffer, then use
+# bandwidth-bound FP16 GEMM (rocBLAS / HIP) instead of ALU-bound trellis.
+# One kernel launch per expert, processes all tiles in parallel.
+# =============================================================================
+
+@triton.jit
+def _exl3_trellis_to_fp16_kernel(
+    B_ptr, Out_ptr,
+    word_idx_ptr, next_word_idx_ptr, shift_ptr,
+    tiles_k, tiles_n,
+    stride_bk, stride_bn, stride_bw,
+    stride_ok, stride_on,
+    WORDS_PER_TILE: tl.constexpr,
+    CB: tl.constexpr,
+):
+    """Dequant one expert's trellis to (K, N) fp16.
+
+    Grid: (tiles_k, tiles_n)
+    Each program decodes one 16×16 B tile and writes to Out.
+    """
+    tk = tl.program_id(0)
+    tn = tl.program_id(1)
+
+    # Load bit extraction tables
+    k_local = tl.arange(0, 16)[:, None]
+    n_local = tl.arange(0, 16)[None, :]
+    mat_pos = k_local * 16 + n_local
+
+    word_idx = tl.load(word_idx_ptr + mat_pos)
+    next_word_idx = tl.load(next_word_idx_ptr + mat_pos)
+    shift = tl.load(shift_ptr + mat_pos)
+    shift_hi = (32 - shift) & 31
+
+    # Load packed B words for this tile
+    b_base = B_ptr + tk * stride_bk + tn * stride_bn
+    lo = tl.load(b_base + word_idx * stride_bw)
+    hi = tl.load(b_base + next_word_idx * stride_bw)
+
+    # Dequant
+    w = _dequant_tile(lo, hi, shift, shift_hi, CB)
+
+    # Store to output (K, N) layout
+    offs_k = tk * 16 + k_local
+    offs_n = tn * 16 + n_local
+    out_ptrs = Out_ptr + offs_k * stride_ok + offs_n * stride_on
+    tl.store(out_ptrs, w)
+
+
+def exl3_trellis_to_fp16(
+    B_stacked: torch.Tensor,
+    bits: int,
+    cb: int = 0,
+    B_i32: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Bulk dequant stacked expert trellis weights to (E, K, N) FP16.
+
+    Fast parallel decode: one kernel launch per expert, all tiles in parallel.
+    Output is raw dequanted weights in Hadamard-rotated space (no Had baked in).
+
+    Args:
+        B_stacked: (E, tiles_k, tiles_n, wpt) int16 — packed trellis weights.
+        bits: Quantization bits (1-8).
+        cb: Codebook variant (0, 1, 2).
+        B_i32: Optional pre-computed int32 view of B_stacked.
+
+    Returns:
+        (E, K, N) float16 — raw dequanted weights per expert.
+    """
+    if B_i32 is None:
+        B_i32 = B_stacked.view(torch.int32)
+
+    E, tiles_k, tiles_n = B_stacked.shape[0], B_stacked.shape[1], B_stacked.shape[2]
+    K = tiles_k * 16
+    N = tiles_n * 16
+    WORDS_PER_TILE = 8 * bits
+
+    word_idx_t, next_word_idx_t, shift_t = get_bit_tables(bits, B_stacked.device)
+
+    out = torch.empty(E, K, N, dtype=torch.float16, device=B_stacked.device)
+
+    for e in range(E):
+        B_expert = B_i32[e]  # (tiles_k, tiles_n, wpt//2)
+        grid = (tiles_k, tiles_n)
+        _exl3_trellis_to_fp16_kernel[grid](
+            B_expert, out[e],
+            word_idx_t, next_word_idx_t, shift_t,
+            tiles_k, tiles_n,
+            B_expert.stride(0), B_expert.stride(1), B_expert.stride(2),
+            out[e].stride(0), out[e].stride(1),
+            WORDS_PER_TILE=WORDS_PER_TILE, CB=cb,
+            num_warps=1, num_stages=1,
+        )
+
+    return out
+
+
+# =============================================================================
 # Fused MoE GEMM Python wrapper
 # =============================================================================
 
@@ -2730,6 +2829,7 @@ def exl3_fused_moe_gemm(
     num_valid_tokens: int = None,
     split_k: int = 0,
     B_i32: torch.Tensor = None,
+    block_m: int = 16,
 ) -> torch.Tensor:
     """
     Fused multi-expert EXL3 dequant + GEMM for MoE layers.
@@ -2752,6 +2852,8 @@ def exl3_fused_moe_gemm(
         num_valid_tokens: Number of real tokens (for bounds). Defaults to M.
         split_k: Split-K factor. 0 = auto-select.
         B_i32: Optional pre-computed int32 view of B_stacked.
+        block_m: M-dimension tile size (16 for decode, 64 for prefill).
+            Larger values amortize trellis dequant across more rows.
 
     Returns:
         C: Output, float16, shape (EM_max, N) or (EM, N).
@@ -2765,7 +2867,7 @@ def exl3_fused_moe_gemm(
     E = B_stacked.shape[0]
     tiles_k, tiles_n = B_stacked.shape[1], B_stacked.shape[2]
     N = tiles_n * 16
-    BLOCK_M = 16
+    BLOCK_M = block_m
     WORDS_PER_TILE = 8 * bits
 
     if num_valid_tokens is None:

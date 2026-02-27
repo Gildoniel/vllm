@@ -54,13 +54,23 @@ _USE_FUSED_MOE_HAD = os.environ.get("EXL3_MOE_FUSED_HAD", "0") == "1"
 _USE_FP16_EXPERTS = os.environ.get("EXL3_FP16_EXPERTS", "0") == "1"
 
 # Env var to enable fused gate+up compound op (1 graph node instead of 7).
-# Default ON — reduces CUDA graph dispatch overhead.
-_USE_FUSED_GATE_UP = os.environ.get("EXL3_FUSED_GATE_UP", "1") == "1"
+# Default OFF — superseded by V2 compound op. Kept for legacy fallback path.
+_USE_FUSED_GATE_UP = os.environ.get("EXL3_FUSED_GATE_UP", "0") == "1"
 
 # V7: Compound Had→GEMM→Had op (1 graph node per projection, 3 GPU kernels).
 # Back-to-back kernel launching — 4 graph nodes per MoE layer instead of 10.
-# Default ON — supersedes fused gate+up when enabled.
-_USE_MOE_COMPOUND = os.environ.get("EXL3_MOE_COMPOUND", "1") == "1"
+# Default OFF — superseded by V2 compound op below.
+_USE_MOE_COMPOUND = os.environ.get("EXL3_MOE_COMPOUND", "0") == "1"
+
+# V2: Zero-allocation compound Had→GEMM→Had. Same 4 graph nodes as V7, but
+# all scratch buffers allocated outside the opaque op (visible to torch.compile
+# memory planner → CUDA graph memory pool, not real cudaMalloc on replay).
+# Default ON when HIP batched Had is available.
+_USE_MOE_COMPOUND_V2 = os.environ.get("EXL3_MOE_COMPOUND_V2", "0") == "1"
+
+# Prefill BLOCK_M=64: kernel-level dequant reuse for prefill.
+# Automatically activated by the HIP kernel when M is large enough.
+# No separate env var needed — controlled by EXL3_PREFILL_M64 in __init__.py.
 
 
 # ---------------------------------------------------------------------------
@@ -1761,9 +1771,12 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         )
         from vllm.model_executor.layers.quantization.exl3_kernels import (
             batched_had_r_128,
+            exl3_fused_moe_gate_up,
             exl3_fused_moe_gemm,
             exl3_fused_moe_gemm_had,
             exl3_moe_had_gemm_had,
+            exl3_moe_had_gemm_had_v2,
+            exl3_trellis_to_fp16,
         )
 
         bits = layer.exl3_bits
@@ -1853,31 +1866,71 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
                 num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
                 B_i32=layer.w2_trellis_i32,
                 B_fp16=w2_fp16)
-        elif _USE_MOE_COMPOUND:
-            # V7: Compound Had→GEMM→Had (4 graph nodes per layer)
-            # Each compound op = 1 graph node launching 3 GPU kernels
-            # back-to-back on the HIP stream.
+        elif _USE_MOE_COMPOUND_V2:
+            # V2: Zero-allocation compound Had→GEMM→Had.
+            # 4 graph nodes per MoE layer (gate, up, silu_mul, down).
+            # All scratch buffers allocated here (visible to torch.compile
+            # memory planner) and passed into the opaque op via mutates_args.
+            from vllm.model_executor.layers.quantization.exl3_kernels import (
+                _get_moe_scratch_buf,
+            )
 
-            # Gate projection: Had_in → GEMM → Had_out [1 node]
-            gate_h = exl3_moe_had_gemm_had(
+            N_inter = layer.w1_svh.shape[1]  # intermediate_size_per_partition
+
+            # Scratch buffers for gate/up (reusable — sequential, not concurrent)
+            buf_xh_gu = _get_moe_scratch_buf("xh_gu", EM_max, K, x.device)
+            buf_C_gu = _get_moe_scratch_buf("C_gu", EM_max, N_inter, x.device)
+            gate_out = _get_moe_scratch_buf("gate_out", EM_max, N_inter, x.device)
+
+            # Gate projection: Had→GEMM→Had
+            exl3_moe_had_gemm_had_v2(
                 x_sorted, layer.w13_suh_gate,
                 layer.w1_trellis, layer.w1_svh,
                 eid_per_token, eid_blocks,
-                num_post_pad_t, EM_max=EM_max, bits=bits,
+                num_post_pad_t, buf_xh_gu, buf_C_gu, gate_out,
+                EM_max=EM_max, bits=bits,
                 B_i32=layer.w1_trellis_i32)
 
-            # Up projection: Had_in → GEMM → Had_out [1 node]
-            up_h = exl3_moe_had_gemm_had(
+            # Up projection: reuse buf_xh_gu, buf_C_gu (gate is done)
+            up_out = _get_moe_scratch_buf("up_out", EM_max, N_inter, x.device)
+
+            exl3_moe_had_gemm_had_v2(
                 x_sorted, layer.w13_suh_up,
                 layer.w3_trellis, layer.w3_svh,
                 eid_per_token, eid_blocks,
-                num_post_pad_t, EM_max=EM_max, bits=bits,
+                num_post_pad_t, buf_xh_gu, buf_C_gu, up_out,
+                EM_max=EM_max, bits=bits,
                 B_i32=layer.w3_trellis_i32)
 
-            # SiLU(gate) * up [1 node]
-            hidden = F.silu(gate_h) * up_h
+            # Activation: silu(gate) * up
+            hidden = F.silu(gate_out) * up_out
 
-            # Down projection: Had_in → GEMM → Had_out [1 node]
+            # Down projection: different dimensions (N_inter → K)
+            buf_xh_dn = _get_moe_scratch_buf("xh_dn", EM_max, N_inter, x.device)
+            buf_C_dn = _get_moe_scratch_buf("C_dn", EM_max, N_out, x.device)
+            down_out = _get_moe_scratch_buf("down_out", EM_max, N_out, x.device)
+
+            exl3_moe_had_gemm_had_v2(
+                hidden, layer.w2_suh,
+                layer.w2_trellis, layer.w2_svh,
+                eid_per_token, eid_blocks,
+                num_post_pad_t, buf_xh_dn, buf_C_dn, down_out,
+                EM_max=EM_max, bits=bits,
+                B_i32=layer.w2_trellis_i32)
+
+            down_h = down_out
+
+        elif _USE_MOE_COMPOUND:
+            # V7/V8: Compound Had→GEMM→Had (allocates internally — legacy).
+            # Superseded by V2 above. Kept for fallback / A-B testing.
+            hidden = exl3_fused_moe_gate_up(
+                x_sorted,
+                layer.w13_suh_gate, layer.w13_suh_up,
+                layer.w1_trellis_i32, layer.w3_trellis_i32,
+                layer.w1_svh, layer.w3_svh,
+                eid_per_token, identity_ids, eid_blocks,
+                num_post_pad_t, EM_max=EM_max, bits=bits)
+
             down_h = exl3_moe_had_gemm_had(
                 hidden, layer.w2_suh,
                 layer.w2_trellis, layer.w2_svh,

@@ -18,6 +18,7 @@ from vllm.model_executor.layers.quantization.exl3_kernels.triton_kernel import (
     exl3_fused_moe_gemm as _exl3_fused_moe_gemm_impl,
     exl3_fused_moe_gemm_had as _exl3_fused_moe_gemm_had_impl,
     exl3_gemm as _exl3_gemm_impl,
+    exl3_trellis_to_fp16,
     get_bit_tables,
 )
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -34,14 +35,19 @@ _hip_ext = None
 
 _HAS_HIP_MOE_FP16 = False
 
-# v3 pipelined kernel toggle: EXL3_HIP_GEMM_V3=1 (default ON) or =0 to force Triton/v2
-_USE_HIP_V3 = os.environ.get("EXL3_HIP_GEMM_V3", "1") == "1"
+# v3 pipelined kernel toggle: EXL3_HIP_GEMM_V3=0 (default OFF) or =1 to enable
+# v3 dense GEMM regresses attention layers (+0.7 tok/s when disabled).
+_USE_HIP_V3 = os.environ.get("EXL3_HIP_GEMM_V3", "0") == "1"
 _HAS_HIP_V3 = False
 _HAS_HIP_MOE_V3 = False
 
 # DPP-fused batched Hadamard-128: EXL3_HIP_HAD=1 (default ON) or =0 to force Triton
 _USE_HIP_HAD = os.environ.get("EXL3_HIP_HAD", "1") == "1"
 _HAS_HIP_MOE_GEMM_HAD = False
+
+# BLOCK_M=64 prefill kernel: EXL3_PREFILL_M64=1 (default ON) or =0 to disable
+_USE_PREFILL_M64 = os.environ.get("EXL3_PREFILL_M64", "1") == "1"
+_HAS_HIP_MOE_M64 = False
 
 _HAS_HIP_BATCHED_HAD = False
 _HAS_HIP_DUAL_HAD = False
@@ -71,6 +77,11 @@ if _USE_HIP_MOE_GEMM:
             _hip_ext is not None
             and hasattr(_hip_ext, 'exl3_fused_moe_gemm_had')
         )
+        if _USE_PREFILL_M64:
+            _HAS_HIP_MOE_M64 = (
+                _hip_ext is not None
+                and hasattr(_hip_ext, 'exl3_fused_moe_gemm_m64')
+            )
         if _USE_HIP_HAD:
             _HAS_HIP_BATCHED_HAD = (
                 _hip_ext is not None
@@ -100,20 +111,39 @@ def _get_v3_lock_buf(grid_m, grid_n64, device):
     return buf[:needed]
 
 
-# Cached split-K partial buffer for HIP MoE path: {(device, split_k): tensor}
+# Cached split-K partial buffer for HIP MoE path: {(device, split_k, N): tensor}
+# Key includes N to avoid non-contiguous slices when gate (N=512) and down
+# (N=2048) share a buffer — .contiguous() on a non-contiguous slice creates
+# a copy every call (96× per step = significant overhead in CUDA graphs).
 _hip_moe_splitk_buf = {}
 
 
 def _get_hip_moe_splitk_buf(split_k, EM, N, device):
     """Get or allocate cached C_partial buffer for HIP MoE split-K."""
-    key = (device, split_k)
+    key = (device, split_k, N)
     buf = _hip_moe_splitk_buf.get(key)
-    if buf is None or buf.shape[1] < EM or buf.shape[2] < N:
+    if buf is None or buf.shape[1] < EM:
         _hip_moe_splitk_buf[key] = torch.empty(
-            (split_k, max(EM, 1), max(N, 1)),
+            (split_k, max(EM, 1), N),
             dtype=torch.float16, device=device)
         buf = _hip_moe_splitk_buf[key]
     return buf
+
+
+# Cached output buffer for HIP MoE GEMM: {(device, N): tensor}
+# Avoids torch.empty allocation 144x/step (48 layers × 3 projections).
+_hip_moe_output_buf = {}
+
+
+def _get_hip_moe_output_buf(EM, N, device):
+    """Get or allocate cached output C buffer for HIP MoE GEMM."""
+    key = (device, N)
+    buf = _hip_moe_output_buf.get(key)
+    if buf is None or buf.shape[0] < EM:
+        _hip_moe_output_buf[key] = torch.empty(
+            (max(EM, 1), N), dtype=torch.float16, device=device)
+        buf = _hip_moe_output_buf[key]
+    return buf[:EM]
 
 
 def _hip_moe_auto_split_k(num_m_blocks, num_k_tiles):
@@ -230,12 +260,11 @@ def _exl3_fused_moe_gemm_hip(
         split_k = _hip_moe_auto_split_k(num_m_blocks, num_k_tiles)
         split_k = min(split_k, num_k_tiles)
 
-        C = torch.zeros(EM_max, N, dtype=torch.float16, device=A.device)
+        C = _get_hip_moe_output_buf(EM_max, N, A.device)
 
         if split_k > 1:
             C_partial = _get_hip_moe_splitk_buf(split_k, EM_max, N, A.device)
-            C_partial = C_partial[:split_k, :EM_max, :N].contiguous()
-            C_partial.zero_()
+            C_partial = C_partial[:split_k, :EM_max, :N]
         else:
             C_partial = torch.empty(
                 1, 1, 1, dtype=torch.float16, device=A.device)
@@ -250,6 +279,15 @@ def _exl3_fused_moe_gemm_hip(
     # Dequant path: B_stacked_i32 is (E, tiles_k, tiles_n, WPT//2)
     N = B_stacked_i32.shape[2] * 16  # tiles_n * 16
 
+    # BLOCK_M=32 prefill path: 2× dequant reuse. DISABLED — benchmarks show
+    # no improvement because GPU hides dequant latency through block-level
+    # parallelism at prefill sizes (1280+ blocks across 64 SIMDs).
+    # Kept for future RDNA4 testing where block scheduling may differ.
+    # if _HAS_HIP_MOE_M64 and num_m_blocks >= 32:
+    #     return _exl3_fused_moe_gemm_hip_m64(
+    #         A, B_stacked_i32, expert_ids, num_tokens_post_padded,
+    #         EM_max, bits)
+
     # Get bit extraction tables
     word_idx, next_word_idx, shift_tbl = get_bit_tables(bits, A.device)
 
@@ -261,13 +299,13 @@ def _exl3_fused_moe_gemm_hip(
     split_k = _hip_moe_auto_split_k(num_m_blocks, num_k_tiles)
     split_k = min(split_k, num_k_tiles)
 
-    # Pre-zeroed output (kernel skips remote experts)
-    C = torch.zeros(EM_max, N, dtype=torch.float16, device=A.device)
+    # Output buffer: kernel writes zeros on early-return for padding M-blocks,
+    # so no Python-side zero_() needed (saves ~1.8 tok/s in CUDA graphs).
+    C = _get_hip_moe_output_buf(EM_max, N, A.device)
 
     if split_k > 1:
         C_partial = _get_hip_moe_splitk_buf(split_k, EM_max, N, A.device)
-        C_partial = C_partial[:split_k, :EM_max, :N].contiguous()
-        C_partial.zero_()
+        C_partial = C_partial[:split_k, :EM_max, :N]
     else:
         C_partial = torch.empty(1, 1, 1, dtype=torch.float16, device=A.device)
 
@@ -276,6 +314,52 @@ def _exl3_fused_moe_gemm_hip(
         expert_ids, num_tokens_post_padded,
         word_idx, next_word_idx, shift_tbl,
         EM_max, bits, 0,  # cb=0 always for HIP
+        split_k, C_partial,
+    )
+    return C
+
+
+def _exl3_fused_moe_gemm_hip_m64(
+    A: torch.Tensor,
+    B_stacked_i32: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    EM_max: int,
+    bits: int,
+) -> torch.Tensor:
+    """Dispatch fused MoE GEMM to HIP BLOCK_M=32 prefill kernel.
+
+    Same as _exl3_fused_moe_gemm_hip but uses the M32 kernel variant
+    that processes 2 M-sub-tiles per block, dequanting B once and
+    reusing for 2 A loads. ~2× less dequant work for prefill.
+    """
+    K = A.shape[1]
+    N = B_stacked_i32.shape[2] * 16
+    num_m_blocks = expert_ids.shape[0]
+    num_k_tiles = K // 16
+
+    word_idx, next_word_idx, shift_tbl = get_bit_tables(bits, A.device)
+
+    # For prefill with large M, split_k=1 is usually optimal
+    num_m_blocks_super = (num_m_blocks + 1) // 2  # M_FACTOR=2
+    if num_m_blocks_super <= 4 and num_k_tiles >= 16:
+        split_k = min(4, num_k_tiles)
+    else:
+        split_k = 1
+
+    C = _get_hip_moe_output_buf(EM_max, N, A.device)
+
+    if split_k > 1:
+        C_partial = _get_hip_moe_splitk_buf(split_k, EM_max, N, A.device)
+        C_partial = C_partial[:split_k, :EM_max, :N]
+    else:
+        C_partial = torch.empty(1, 1, 1, dtype=torch.float16, device=A.device)
+
+    _hip_ext.exl3_fused_moe_gemm_m64(
+        A, B_stacked_i32, C,
+        expert_ids, num_tokens_post_padded,
+        word_idx, next_word_idx, shift_tbl,
+        EM_max, bits, 0,  # cb=0
         split_k, C_partial,
     )
     return C
@@ -388,6 +472,31 @@ def exl3_fused_moe_gemm(
     )
 
 
+def exl3_fused_moe_gemm_prefill(
+    A: torch.Tensor,
+    B_stacked: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: "int | torch.Tensor",
+    EM_max: int = 0,
+    bits: int = 4,
+    cb: int = 0,
+    B_i32: torch.Tensor | None = None,
+    block_m: int = 64,
+) -> torch.Tensor:
+    """Prefill-optimized fused MoE GEMM: Triton with larger BLOCK_M.
+
+    Bypasses custom op (no graph capture needed) and HIP (BLOCK_M=16 hardcoded).
+    Larger BLOCK_M amortizes trellis dequant across more A rows per B tile load.
+    BLOCK_M=64 → 4x less dequant ALU vs BLOCK_M=16.
+    """
+    return _exl3_fused_moe_gemm_impl(
+        A, B_stacked, sorted_token_ids, expert_ids,
+        num_tokens_post_padded, EM_max=EM_max, bits=bits, cb=cb,
+        B_i32=B_i32, block_m=block_m, split_k=1,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Register exl3_fused_moe_gemm_had as a custom op for torch.compile.
 # ---------------------------------------------------------------------------
@@ -431,15 +540,14 @@ def _exl3_fused_moe_gemm_had_hip(
     split_k = _hip_moe_auto_split_k(num_m_blocks, num_k_tiles)
     split_k = min(split_k, num_k_tiles)
 
-    # Pre-zeroed output (kernel skips remote experts)
-    C = torch.zeros(EM_max, N, dtype=torch.float16, device=A.device)
+    # Kernel writes zeros on early-return for padding M-blocks
+    C = _get_hip_moe_output_buf(EM_max, N, A.device)
 
     has_svh = 1 if svh_stacked.numel() > 0 else 0
 
     if split_k > 1:
         C_partial = _get_hip_moe_splitk_buf(split_k, EM_max, N, A.device)
-        C_partial = C_partial[:split_k, :EM_max, :N].contiguous()
-        C_partial.zero_()
+        C_partial = C_partial[:split_k, :EM_max, :N]
     else:
         C_partial = torch.empty(1, 1, 1, dtype=torch.float16, device=A.device)
 
@@ -676,35 +784,67 @@ def _exl3_fused_moe_gate_up_op(
     up_gemm → up_output_had → silu_mul.
 
     Returns the hidden state (silu(gate_h) * up_h) ready for down projection.
+    Uses _hip_ext directly when available to avoid torch.ops dispatch overhead.
     """
-    # Dual input Had (gate + up share x_sorted)
+    M = x_sorted.size(0)
+
+    if _HAS_HIP_DUAL_HAD and expert_ids_expanded.size(0) == M:
+        # --- HIP fast path: all _hip_ext calls, no framework dispatch ---
+        eid_int = expert_ids_expanded.int()
+
+        # 1. Dual input Had: reads x_sorted once, writes xh_gate + xh_up
+        xh_gate = torch.empty_like(x_sorted)
+        xh_up = torch.empty_like(x_sorted)
+        _hip_ext.batched_dual_had_r_128(
+            x_sorted, w13_suh_gate, w13_suh_up,
+            xh_gate, xh_up, eid_int, 1)  # pre=True
+
+        # 2. Gate GEMM (direct HIP)
+        gate = _exl3_fused_moe_gemm_hip(
+            xh_gate, w1_trellis_i32, eid_blocks,
+            num_tokens_post_padded, EM_max, bits)
+
+        # 3. Gate output Had (direct HIP)
+        gate_h = torch.empty(M, N_gate, dtype=torch.float16,
+                             device=x_sorted.device)
+        _hip_ext.batched_had_r_128(
+            gate, w1_svh, gate_h, eid_int, 0)
+
+        # 4. Up GEMM (direct HIP)
+        up = _exl3_fused_moe_gemm_hip(
+            xh_up, w3_trellis_i32, eid_blocks,
+            num_tokens_post_padded, EM_max, bits)
+
+        # 5. Up output Had (direct HIP)
+        up_h = torch.empty(M, N_up, dtype=torch.float16,
+                           device=x_sorted.device)
+        _hip_ext.batched_had_r_128(
+            up, w3_svh, up_h, eid_int, 0)
+
+        # 6. SiLU(gate) * up
+        return F.silu(gate_h) * up_h
+
+    # --- Fallback: dispatch through torch.ops.vllm ---
     xh_gate, xh_up = torch.ops.vllm.batched_dual_had_r_128(
         x_sorted, w13_suh_gate, w13_suh_up,
-        expert_ids_expanded, 1)  # pre=True
+        expert_ids_expanded, 1)
 
-    # Gate GEMM
     gate = torch.ops.vllm.exl3_fused_moe_gemm(
         xh_gate, w1_trellis_i32, identity_ids, eid_blocks,
         num_tokens_post_padded,
         torch.empty(0, dtype=torch.float16, device=x_sorted.device),
         EM_max, N_gate, bits, 0)
-
-    # Gate output Had
     gate_h = torch.ops.vllm.batched_had_r_128(
-        gate, w1_svh, expert_ids_expanded, 0)  # pre=False (post-scale)
+        gate, w1_svh, expert_ids_expanded, 0)
 
-    # Up GEMM
     up = torch.ops.vllm.exl3_fused_moe_gemm(
         xh_up, w3_trellis_i32, identity_ids, eid_blocks,
         num_tokens_post_padded,
         torch.empty(0, dtype=torch.float16, device=x_sorted.device),
         EM_max, N_up, bits, 0)
-
-    # Up output Had
     up_h = torch.ops.vllm.batched_had_r_128(
-        up, w3_svh, expert_ids_expanded, 0)  # pre=False (post-scale)
+        up, w3_svh, expert_ids_expanded, 0)
 
-    # SiLU(gate) * up
     return F.silu(gate_h) * up_h
 
 
@@ -782,8 +922,8 @@ def exl3_fused_moe_gate_up(
 # kernels back-to-back on the HIP stream with no framework dispatch overhead.
 # ---------------------------------------------------------------------------
 
-# Toggle: EXL3_MOE_COMPOUND=1 (default ON when HIP batched Had available)
-_USE_MOE_COMPOUND = os.environ.get("EXL3_MOE_COMPOUND", "1") == "1"
+# Toggle: EXL3_MOE_COMPOUND=0 (default OFF — superseded by V2)
+_USE_MOE_COMPOUND = os.environ.get("EXL3_MOE_COMPOUND", "0") == "1"
 
 
 def _exl3_moe_had_gemm_had_op(
@@ -929,6 +1069,179 @@ def exl3_moe_had_gemm_had(
     )
 
 
+# ---------------------------------------------------------------------------
+# Zero-allocation compound Had→GEMM→Had (V2).
+#
+# Same kernel sequence as V7 exl3_moe_had_gemm_had, but ALL scratch buffers
+# (xh, C, output) are passed IN from the caller — zero torch.empty inside
+# the opaque op.  This lets torch.compile's memory planner own the buffers
+# so they live in the CUDA graph memory pool instead of hitting real
+# cudaMalloc on every graph replay.
+#
+# Toggle: EXL3_MOE_COMPOUND_V2=1 (default ON when HIP batched Had available)
+# ---------------------------------------------------------------------------
+
+_USE_MOE_COMPOUND_V2 = os.environ.get("EXL3_MOE_COMPOUND_V2", "1") == "1"
+
+# Scratch buffer cache: {(name, device, cols): tensor}
+# Grows if rows increase (decode→prefill), never shrinks.
+_moe_scratch_bufs = {}
+
+
+def _get_moe_scratch_buf(name: str, rows: int, cols: int, device):
+    """Get or allocate a cached scratch buffer for compound MoE ops.
+
+    Keyed by (name, device, cols). Grows row-wise if needed.
+    Allocated via torch.empty in Python (visible to torch.compile memory
+    planner → replayed from CUDA graph memory pool).
+    """
+    key = (name, device, cols)
+    buf = _moe_scratch_bufs.get(key)
+    if buf is None or buf.shape[0] < rows:
+        _moe_scratch_bufs[key] = torch.empty(
+            (max(rows, 1), cols), dtype=torch.float16, device=device)
+        buf = _moe_scratch_bufs[key]
+    return buf[:rows]
+
+
+def _exl3_moe_had_gemm_had_v2_op(
+    x_sorted: torch.Tensor,           # (EM_max, K_in)
+    suh_stacked: torch.Tensor,        # (E, K_in) input Had scale
+    B_stacked_i32: torch.Tensor,      # (E, tiles_k, tiles_n, WPT//2) weights
+    svh_stacked: torch.Tensor,        # (E, N_out) output Had scale
+    eid_per_token: torch.Tensor,      # (EM_max,) expert ID per row (Had)
+    eid_blocks: torch.Tensor,         # (num_m_blocks,) expert ID per block (GEMM)
+    num_tokens_post_padded: torch.Tensor,
+    buf_xh: torch.Tensor,            # scratch: (EM_max, K_in) — mutated
+    buf_C: torch.Tensor,             # scratch: (EM_max, N_out) — mutated
+    output: torch.Tensor,            # result: (EM_max, N_out) — mutated
+    EM_max: int,
+    N_out: int,
+    bits: int,
+) -> None:
+    """V2 compound op: Had_in → GEMM → Had_out, zero internal allocations.
+
+    All scratch buffers are passed in and mutated in-place.
+    Launches 3 GPU kernels back-to-back on the HIP stream.
+    """
+    M = x_sorted.size(0)
+    eid_len = eid_per_token.size(0)
+
+    if _HAS_HIP_BATCHED_HAD and eid_len == M:
+        # --- HIP fast path: direct _hip_ext calls, no framework dispatch ---
+        eid_int = eid_per_token.int()
+
+        # 1. Input Hadamard: x_sorted → buf_xh
+        _hip_ext.batched_had_r_128(
+            x_sorted, suh_stacked, buf_xh,
+            eid_int, 1)  # pre=True
+
+        # 2. GEMM: buf_xh → buf_C (reuses existing HIP helper with cached bufs)
+        C_result = _exl3_fused_moe_gemm_hip(
+            buf_xh, B_stacked_i32, eid_blocks,
+            num_tokens_post_padded, EM_max, bits)
+        # Copy into buf_C if _exl3_fused_moe_gemm_hip returned a different buffer
+        if C_result.data_ptr() != buf_C.data_ptr():
+            buf_C[:C_result.shape[0], :C_result.shape[1]].copy_(C_result)
+
+        # 3. Output Hadamard: buf_C → output
+        _hip_ext.batched_had_r_128(
+            buf_C, svh_stacked, output,
+            eid_int, 0)  # pre=False (post-scale)
+        return
+
+    # --- Fallback: dispatch through torch.ops.vllm (Triton or HIP GEMM) ---
+    identity_ids = torch.arange(
+        M, device=x_sorted.device, dtype=torch.int32)
+    eid_sliced = eid_per_token[:M]
+
+    # 1. Input Hadamard
+    xh = torch.ops.vllm.batched_had_r_128(
+        x_sorted, suh_stacked, eid_sliced, 1)
+    buf_xh.copy_(xh)
+
+    # 2. GEMM
+    C = torch.ops.vllm.exl3_fused_moe_gemm(
+        buf_xh, B_stacked_i32, identity_ids, eid_blocks,
+        num_tokens_post_padded,
+        torch.empty(0, dtype=torch.float16, device=x_sorted.device),
+        EM_max, N_out, bits, 0)
+    buf_C[:C.shape[0], :C.shape[1]].copy_(C)
+
+    # 3. Output Hadamard
+    out = torch.ops.vllm.batched_had_r_128(
+        buf_C, svh_stacked, eid_sliced, 0)
+    output.copy_(out)
+
+
+def _exl3_moe_had_gemm_had_v2_fake(
+    x_sorted: torch.Tensor,
+    suh_stacked: torch.Tensor,
+    B_stacked_i32: torch.Tensor,
+    svh_stacked: torch.Tensor,
+    eid_per_token: torch.Tensor,
+    eid_blocks: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    buf_xh: torch.Tensor,
+    buf_C: torch.Tensor,
+    output: torch.Tensor,
+    EM_max: int,
+    N_out: int,
+    bits: int,
+) -> None:
+    """Fake impl for Dynamo — mutates output in-place, returns None."""
+    # output is mutated in-place; Dynamo tracks via mutates_args
+    return
+
+
+direct_register_custom_op(
+    op_name="exl3_moe_had_gemm_had_v2",
+    op_func=_exl3_moe_had_gemm_had_v2_op,
+    mutates_args=["buf_xh", "buf_C", "output"],
+    fake_impl=_exl3_moe_had_gemm_had_v2_fake,
+)
+
+
+def exl3_moe_had_gemm_had_v2(
+    x_sorted: torch.Tensor,
+    suh_stacked: torch.Tensor,
+    B_stacked: torch.Tensor,
+    svh_stacked: torch.Tensor,
+    eid_per_token: torch.Tensor,
+    eid_blocks: torch.Tensor,
+    num_tokens_post_padded: "int | torch.Tensor",
+    buf_xh: torch.Tensor,
+    buf_C: torch.Tensor,
+    output: torch.Tensor,
+    EM_max: int,
+    bits: int = 4,
+    B_i32: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """V2 compound Had→GEMM→Had: zero internal allocations.
+
+    All scratch buffers (buf_xh, buf_C, output) are caller-allocated and
+    passed in. Returns output (same tensor, mutated in-place).
+    """
+    if B_i32 is None:
+        B_i32 = B_stacked.view(torch.int32)
+    if isinstance(num_tokens_post_padded, int):
+        num_post_pad_t = torch.tensor(
+            [num_tokens_post_padded], dtype=torch.int32,
+            device=x_sorted.device)
+    else:
+        num_post_pad_t = num_tokens_post_padded.to(torch.int32)
+
+    N_out = output.shape[1]
+
+    torch.ops.vllm.exl3_moe_had_gemm_had_v2(
+        x_sorted, suh_stacked, B_i32, svh_stacked,
+        eid_per_token, eid_blocks,
+        num_post_pad_t, buf_xh, buf_C, output,
+        EM_max, N_out, bits,
+    )
+    return output
+
+
 __all__ = ["exl3_gemm", "exl3_fused_moe_gemm", "exl3_fused_moe_gemm_had",
            "had_r_128", "batched_had_r_128", "exl3_fused_moe_gate_up",
-           "exl3_moe_had_gemm_had"]
+           "exl3_moe_had_gemm_had", "exl3_moe_had_gemm_had_v2"]
