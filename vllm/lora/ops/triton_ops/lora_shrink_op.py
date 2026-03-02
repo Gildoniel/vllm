@@ -168,10 +168,15 @@ def _lora_shrink(
         # None of the inputs require LoRA.
         return
 
-    assert inputs.dtype == lora_a_weights[0].dtype
-    assert inputs.dtype in [torch.float16, torch.bfloat16]
-    for weight in lora_a_weights:
-        assert weight.dtype in [torch.float16, torch.bfloat16]
+    # Cast inputs to match LoRA weight dtype if needed (e.g. compiled graphs
+    # may produce a different dtype than the LoRA weights).
+    # NOTE: output_tensor is intentionally FP32 for accumulation precision
+    # (allocated in column/row_parallel_linear.py) — the Triton kernel
+    # handles mixed FP16 input / FP32 output natively.
+    target_dtype = lora_a_weights[0].dtype
+    assert target_dtype in [torch.float16, torch.bfloat16]
+    if inputs.dtype != target_dtype:
+        inputs = inputs.to(target_dtype)
 
     assert inputs.size(1) == lora_a_weights[0].size(-1)
     assert inputs.is_contiguous()

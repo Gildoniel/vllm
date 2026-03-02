@@ -158,6 +158,9 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         # marlin
         elif hasattr(self.base_layer, "B"):
             return self.base_layer.B
+        # EXL3
+        elif hasattr(self.base_layer, "trellis"):
+            return self.base_layer.trellis
         else:
             raise ValueError(f"Unsupported base layer: {self.base_layer}")
 

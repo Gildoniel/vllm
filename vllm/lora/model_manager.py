@@ -401,9 +401,11 @@ class LoRAModelManager:
             # name may have different types, such as nn.Linear and
             # ReplicatedLinear. The nn.Linear layers cannot be replaced with
             # LoRA layers, leading to assertion error. The following check
-            # aims to prevent this error
-            if self.supports_mm and not isinstance(new_module, BaseLayerWithLoRA):
-                continue
+            # aims to prevent this error.
+            # Also skip FusedMoE layers that couldn't be replaced (e.g. EP).
+            if not isinstance(new_module, BaseLayerWithLoRA):
+                if self.supports_mm or isinstance(module, FusedMoE):
+                    continue
             self.register_module(module_name, new_module)
 
             self._register_packed_modules(module_name)

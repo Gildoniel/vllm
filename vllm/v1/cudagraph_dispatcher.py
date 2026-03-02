@@ -294,6 +294,20 @@ class CudagraphDispatcher:
                 effective_num_active_loras = self.vllm_config.lora_config.max_loras + 1
 
         normalized_uniform = uniform_decode and self.cudagraph_mode.separate_routine()
+
+        # When cudagraph_specialize_lora is False, all graphs are captured
+        # with has_lora=True and num_active_loras=max_loras+1. Non-LoRA
+        # requests must reuse these graphs — LoRA kernels early-exit via
+        # no_lora_flag_cpu.
+        if (
+            self.vllm_config.lora_config
+            and not self.compilation_config.cudagraph_specialize_lora
+            and not has_lora
+        ):
+            has_lora = True
+            effective_num_active_loras = (
+                self.vllm_config.lora_config.max_loras + 1
+            )
         batch_desc = self._create_padded_batch_descriptor(
             num_tokens, normalized_uniform, has_lora, effective_num_active_loras
         )

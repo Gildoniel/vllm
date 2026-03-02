@@ -682,6 +682,21 @@ class VllmConfig:
                 self.model_config, self.load_config
             )
 
+        # EXL3 + LoRA: disable CUDA graph specialization for LoRA.
+        # EXL3 custom ops (exl3_gemm) interact badly with the separate
+        # has_lora=False CUDA graph capture path, producing corrupt output.
+        # Using a single set of graphs (always LoRA-enabled) works correctly
+        # because the LoRA kernels early-exit via no_lora_flag_cpu when no
+        # adapter is active.
+        if (self.lora_config is not None
+                and self.model_config is not None
+                and self.model_config.quantization == "exl3"
+                and self.compilation_config.cudagraph_specialize_lora):
+            self.compilation_config.cudagraph_specialize_lora = False
+            logger.info_once(
+                "EXL3 + LoRA: disabling cudagraph_specialize_lora to "
+                "avoid output corruption with CUDA graph specialization.")
+
         executor_backend = self.parallel_config.distributed_executor_backend
         executor_supports_async_sched = executor_backend in (
             "mp",

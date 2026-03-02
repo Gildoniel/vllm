@@ -617,6 +617,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         """Returns True if the layer can be replaced by this LoRA layer."""
 
         # source_layer is FusedMoE or SharedFusedMoE
+        # Skip LoRA wrapping for FusedMoE when EP is enabled (not supported)
+        if isinstance(source_layer, FusedMoE) and source_layer.use_ep:
+            return False
         return isinstance(source_layer, FusedMoE) and len(packed_modules_list) == 2
 
 
@@ -779,4 +782,7 @@ class FusedMoE3DWithLoRA(FusedMoEWithLoRA):
     ) -> bool:
         """Returns True if the layer can be replaced by this LoRA layer."""
         # source_layer is FusedMoE or SharedFusedMoE
+        # Skip LoRA wrapping for FusedMoE when EP is enabled (not supported)
+        if isinstance(source_layer, FusedMoE) and source_layer.use_ep:
+            return False
         return isinstance(source_layer, FusedMoE) and len(packed_modules_list) == 1

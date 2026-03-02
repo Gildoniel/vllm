@@ -50,6 +50,9 @@ def _get_lora_device(base_layer: nn.Module) -> torch.device:
     # MoE GPTQ/AWQ/GGUF
     elif hasattr(base_layer, "w2_qweight"):
         return base_layer.w2_qweight.device
+    # EXL3
+    elif hasattr(base_layer, "trellis"):
+        return base_layer.trellis.device
     else:
         raise ValueError(f"Unsupported base layer: {base_layer}")
 
