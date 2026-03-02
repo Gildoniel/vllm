@@ -60,7 +60,7 @@ _USE_FUSED_GATE_UP = os.environ.get("EXL3_FUSED_GATE_UP", "0") == "1"
 # V7: Compound Had→GEMM→Had op (1 graph node per projection, 3 GPU kernels).
 # Back-to-back kernel launching — 4 graph nodes per MoE layer instead of 10.
 # Default OFF — superseded by V2 compound op below.
-_USE_MOE_COMPOUND = os.environ.get("EXL3_MOE_COMPOUND", "0") == "1"
+_USE_MOE_COMPOUND = os.environ.get("EXL3_MOE_COMPOUND", "1") == "1"
 
 # V2: Zero-allocation compound Had→GEMM→Had. Same 4 graph nodes as V7, but
 # all scratch buffers allocated outside the opaque op (visible to torch.compile
@@ -71,6 +71,11 @@ _USE_MOE_COMPOUND = os.environ.get("EXL3_MOE_COMPOUND", "0") == "1"
 # CUDA graphs already capture the same kernel launches regardless of
 # whether they're grouped in 3 compound ops or 11 separate ops.
 _USE_MOE_COMPOUND_V2 = os.environ.get("EXL3_MOE_COMPOUND_V2", "0") == "1"
+
+# V10.5: Batched multi-GEMM for merged layers (QKV, gate_up).
+# Groups matching-N sub-projections into one exl3_multi_gemm launch.
+# Default ON. Set EXL3_MULTI_GEMM=0 to use sequential per-projection path.
+_USE_MULTI_GEMM = os.environ.get("EXL3_MULTI_GEMM", "1") == "1"
 
 # Prefill BLOCK_M=64: kernel-level dequant reuse for prefill.
 # Automatically activated by the HIP kernel when M is large enough.
@@ -97,6 +102,9 @@ def _make_exl3_weight_loader(linear_weight_loader, output_sizes):
             _load_suh(param, loaded_weight, loaded_shard_id, output_sizes)
         elif isinstance(param, EXL3ScaleParameter):
             _load_svh(param, loaded_weight, loaded_shard_id, output_sizes)
+        elif getattr(param, '_exl3_cb_dummy', False):
+            # Codebook marker tensor (mcg/mul1): silently absorb, no-op
+            pass
         else:
             if loaded_shard_id is not None:
                 linear_weight_loader(param, loaded_weight, loaded_shard_id)
@@ -297,16 +305,21 @@ class EXL3ScaleParameter(BasevLLMParameter):
 class EXL3Config(QuantizationConfig):
     """Config class for EXL3 (ExLlamaV3) trellis-coded quantization."""
 
+    # Codebook name → cb integer mapping
+    _CODEBOOK_MAP = {"3inst": 0, "mcg": 1, "mul1": 2}
+
     def __init__(
         self,
         weight_bits: int,
         head_bits: int,
         tensor_storage: dict[str, Any],
+        cb: int = 0,
     ) -> None:
         super().__init__()
         self.weight_bits = weight_bits
         self.head_bits = head_bits
         self.tensor_storage = tensor_storage
+        self.cb = cb
 
         # Build lookup: prefix -> bits_per_weight (only for EXL3 layers)
         self._layer_bits: dict[str, int] = {}
@@ -318,10 +331,18 @@ class EXL3Config(QuantizationConfig):
             else:
                 self._unquantized_layers.append(prefix)
 
+        # Build normalized lookup for VL and other multi-nested models.
+        # tensor_storage keys may use "model.language_model.X" but vLLM
+        # prefixes use "language_model.model.X" due to hf_to_vllm_mapper.
+        self._layer_bits_normalized: dict[str, int] = {}
+        for prefix, bits in self._layer_bits.items():
+            norm = self._normalize_prefix(prefix)
+            self._layer_bits_normalized[norm] = bits
+
     def __repr__(self) -> str:
         return (
             f"EXL3Config(weight_bits={self.weight_bits}, "
-            f"head_bits={self.head_bits})"
+            f"head_bits={self.head_bits}, cb={self.cb})"
         )
 
     def get_name(self) -> "QuantizationMethods":
@@ -343,7 +364,29 @@ class EXL3Config(QuantizationConfig):
         weight_bits = int(config.get("bits", 4))
         head_bits = int(config.get("head_bits", 6))
         tensor_storage = config.get("tensor_storage", {})
-        return cls(weight_bits, head_bits, tensor_storage)
+        codebook_name = config.get("codebook", "3inst")
+        cb = cls._CODEBOOK_MAP.get(codebook_name, 0)
+        if codebook_name not in cls._CODEBOOK_MAP:
+            logger.warning(
+                "EXL3: unknown codebook '%s', defaulting to cb=0 (3inst)",
+                codebook_name)
+        else:
+            logger.info("EXL3: codebook=%s (cb=%d)", codebook_name, cb)
+        return cls(weight_bits, head_bits, tensor_storage, cb=cb)
+
+    @staticmethod
+    def _normalize_prefix(prefix: str) -> str:
+        """Strip model nesting prefixes to get canonical layer path.
+
+        VL models have checkpoint paths like 'model.language_model.layers.0...'
+        but vLLM module paths like 'language_model.model.layers.0...'.
+        Normalize both to 'layers.0...' for matching.
+        """
+        for p in ("model.language_model.", "language_model.model.",
+                  "language_model.", "model."):
+            if prefix.startswith(p):
+                return prefix[len(p):]
+        return prefix
 
     def _get_moe_layer_bits(self, prefix: str) -> int | None:
         """Look up bits_per_weight for a MoE expert layer.
@@ -357,8 +400,12 @@ class EXL3Config(QuantizationConfig):
             return self.weight_bits
 
         stripped = prefix.removeprefix("model.")
+        norm = self._normalize_prefix(prefix)
         for key, bits in self._layer_bits.items():
-            if key.startswith(stripped + ".") or key.startswith(prefix + "."):
+            key_norm = self._normalize_prefix(key)
+            if (key.startswith(stripped + ".")
+                    or key.startswith(prefix + ".")
+                    or key_norm.startswith(norm + ".")):
                 return bits
         return None
 
@@ -384,6 +431,19 @@ class EXL3Config(QuantizationConfig):
                 unfused_stripped = unfused_prefix.removeprefix("model.")
                 if unfused_stripped in self._layer_bits:
                     return self._layer_bits[unfused_stripped]
+
+            # Try normalized prefix matching for VL and multi-nested models.
+            # E.g. tensor_storage has "model.language_model.layers.0.mlp.q_proj"
+            # but vLLM prefix is "language_model.model.layers.0.mlp.qkv_proj".
+            norm = self._normalize_prefix(prefix)
+            if norm in self._layer_bits_normalized:
+                return self._layer_bits_normalized[norm]
+            # Also try packed module on normalized prefix
+            if proj_name in self.packed_modules_mapping:
+                first_shard = self.packed_modules_mapping[proj_name][0]
+                norm_unfused = norm.rsplit(".", 1)[0] + "." + first_shard
+                if norm_unfused in self._layer_bits_normalized:
+                    return self._layer_bits_normalized[norm_unfused]
 
             return None
         else:
@@ -543,9 +603,32 @@ class EXL3LinearMethod(LinearMethodBase):
         layer.register_parameter("suh", suh)
         layer.register_parameter("svh", svh)
 
+        # Register codebook marker dummy param (mcg/mul1) so vLLM's
+        # weight loader doesn't crash on the checkpoint tensor.
+        self._register_cb_dummy(layer, exl3_loader)
+
         layer.exl3_bits = self.bits
+        layer.exl3_cb = self.quant_config.cb
         layer.exl3_output_partition_sizes = output_partition_sizes
         layer._exl3_dequant = False
+
+    def _register_cb_dummy(self, layer, weight_loader):
+        """Register a codebook marker dummy parameter if cb != 0.
+
+        MCG models (cb=1) have a per-layer 'mcg' scalar int32 tensor
+        in the checkpoint. MUL1 models (cb=2) have 'mul1'. We register
+        a dummy parameter so the weight loader can absorb it silently.
+        """
+        cb = self.quant_config.cb
+        cb_names = {1: "mcg", 2: "mul1"}
+        if cb in cb_names:
+            name = cb_names[cb]
+            dummy = BasevLLMParameter(
+                data=torch.zeros(1, dtype=torch.int32),
+                weight_loader=weight_loader,
+            )
+            dummy._exl3_cb_dummy = True
+            layer.register_parameter(name, dummy)
 
     def _create_weights_dequant(
         self,
@@ -635,7 +718,11 @@ class EXL3LinearMethod(LinearMethodBase):
         layer.register_parameter("suh", suh)
         layer.register_parameter("svh", svh)
 
+        # Register codebook marker dummy param (mcg/mul1)
+        self._register_cb_dummy(layer, exl3_loader)
+
         layer.exl3_bits = self.bits
+        layer.exl3_cb = self.quant_config.cb
         layer.exl3_output_partition_sizes = output_partition_sizes
         layer._exl3_dequant = True
         layer._exl3_dequant_full_output_sizes = full_output_partition_sizes
@@ -669,6 +756,77 @@ class EXL3LinearMethod(LinearMethodBase):
         get_bit_tables(layer.exl3_bits, device)
         _get_had128(device)
 
+        # Pre-compute batched weight groups for merged layers (QKV, gate_up).
+        # Groups sub-projections by matching N so they can be dispatched as
+        # a single multi-GEMM launch for better CU occupancy.
+        suh = layer.suh.data
+        if suh.dim() == 2:
+            output_partition_sizes = layer.exl3_output_partition_sizes
+            trellis_i32 = layer.trellis_i32
+            num_proj = suh.shape[0]
+
+            # Build per-projection metadata
+            proj_infos = []
+            tile_offset = 0
+            out_offset = 0
+            for i in range(num_proj):
+                proj_size = output_partition_sizes[i]
+                proj_tiles = proj_size // 16
+                proj_infos.append({
+                    'index': i,
+                    'proj_size': proj_size,
+                    'proj_tiles': proj_tiles,
+                    'tile_offset': tile_offset,
+                    'out_offset': out_offset,
+                })
+                tile_offset += proj_tiles
+                out_offset += proj_size
+
+            # Group by matching N (proj_tiles)
+            from collections import defaultdict
+            groups_by_tiles = defaultdict(list)
+            for pi in proj_infos:
+                groups_by_tiles[pi['proj_tiles']].append(pi)
+
+            batched_groups = []
+            singleton_groups = []
+            for proj_tiles, members in groups_by_tiles.items():
+                if len(members) >= 2:
+                    # Stack trellis slices: (n_batch, tiles_k, tiles_n, wpt)
+                    slices = []
+                    indices = []
+                    out_offsets = []
+                    for m in members:
+                        s = trellis_i32[:, m['tile_offset']:
+                                        m['tile_offset'] + m['proj_tiles'], :]
+                        slices.append(s.contiguous())
+                        indices.append(m['index'])
+                        out_offsets.append(m['out_offset'])
+                    B_stacked = torch.stack(slices, dim=0)
+                    batched_groups.append({
+                        'indices': indices,
+                        'B_stacked_i32': B_stacked,
+                        'n_batch': len(members),
+                        'proj_N': members[0]['proj_size'],
+                        'out_offsets': out_offsets,
+                    })
+                else:
+                    m = members[0]
+                    s = trellis_i32[:, m['tile_offset']:
+                                    m['tile_offset'] + m['proj_tiles'], :]
+                    singleton_groups.append({
+                        'index': m['index'],
+                        'trellis_i32': s.contiguous(),
+                        'trellis': layer.trellis.data[
+                            :, m['tile_offset']:
+                            m['tile_offset'] + m['proj_tiles'], :],
+                        'out_offset': m['out_offset'],
+                        'proj_N': m['proj_size'],
+                    })
+
+            layer.exl3_batched_groups = batched_groups
+            layer.exl3_singleton_groups = singleton_groups
+
     def _process_weights_dequant(self, layer: torch.nn.Module) -> None:
         """Dequantize EXL3 weights to FP16 for Had-128-incompatible layers.
 
@@ -685,6 +843,7 @@ class EXL3LinearMethod(LinearMethodBase):
         suh = layer.suh.data
         svh = layer.svh.data
         bits = layer.exl3_bits
+        cb = getattr(layer, 'exl3_cb', 0)
         full_output_sizes = layer._exl3_dequant_full_output_sizes
         tp_size = layer._exl3_dequant_tp_size
         tp_rank = get_tensor_model_parallel_rank()
@@ -728,7 +887,7 @@ class EXL3LinearMethod(LinearMethodBase):
 
                 # GEMM
                 proj_out = exl3_gemm(
-                    xh, proj_trellis, bits=bits, cb=0,
+                    xh, proj_trellis, bits=bits, cb=cb,
                     B_i32=proj_trellis_i32,
                 )
 
@@ -785,6 +944,7 @@ class EXL3LinearMethod(LinearMethodBase):
 
         from vllm.model_executor.layers.quantization.exl3_kernels import (
             exl3_gemm,
+            exl3_multi_gemm,
             had_r_128,
         )
 
@@ -792,6 +952,7 @@ class EXL3LinearMethod(LinearMethodBase):
         suh = layer.suh
         svh = layer.svh
         bits = layer.exl3_bits
+        cb = getattr(layer, 'exl3_cb', 0)
         output_partition_sizes = layer.exl3_output_partition_sizes
 
         orig_shape = x.shape[:-1]
@@ -805,47 +966,95 @@ class EXL3LinearMethod(LinearMethodBase):
             had_r_128(x_2d, xh, suh, None, 1.0)
 
             out = exl3_gemm(
-                xh, trellis, bits=bits, cb=0,
+                xh, trellis, bits=bits, cb=cb,
                 B_i32=layer.trellis_i32,
             )
 
             out_h = torch.empty_like(out)
             had_r_128(out, out_h, None, svh, 1.0)
         else:
-            # Merged layer: run each projection separately with its own suh
+            # Merged layer
             num_proj = suh.shape[0]
             N_total = sum(output_partition_sizes)
             out_h = torch.empty((M, N_total), dtype=x_2d.dtype,
                                 device=x_2d.device)
 
-            tile_offset = 0
-            out_offset = 0
-            for i in range(num_proj):
-                proj_suh = suh[i]
-                proj_size = output_partition_sizes[i]
-                proj_tiles = proj_size // 16
+            if (_USE_MULTI_GEMM
+                    and hasattr(layer, 'exl3_batched_groups')):
+                # V10.5: group-by-N batched dispatch
+                # Singleton groups (unique N): sequential Had→GEMM→Had
+                for sg in layer.exl3_singleton_groups:
+                    i = sg['index']
+                    xh = torch.empty_like(x_2d)
+                    had_r_128(x_2d, xh, suh[i], None, 1.0)
 
-                # Input Hadamard with this projection's suh
-                xh = torch.empty_like(x_2d)
-                had_r_128(x_2d, xh, proj_suh, None, 1.0)
+                    proj_out = exl3_gemm(
+                        xh, sg['trellis'], bits=bits, cb=cb,
+                        B_i32=sg['trellis_i32'],
+                    )
 
-                # Slice trellis for this projection
-                proj_trellis = trellis.narrow(1, tile_offset, proj_tiles)
-                proj_trellis_i32 = proj_trellis.contiguous().view(torch.int32)
+                    proj_svh = svh.narrow(
+                        0, sg['out_offset'], sg['proj_N'])
+                    proj_out_h = out_h.narrow(
+                        1, sg['out_offset'], sg['proj_N'])
+                    had_r_128(proj_out, proj_out_h, None, proj_svh, 1.0)
 
-                # GEMM
-                proj_out = exl3_gemm(
-                    xh, proj_trellis, bits=bits, cb=0,
-                    B_i32=proj_trellis_i32,
-                )
+                # Batched groups (matching N): multi-GEMM
+                for bg in layer.exl3_batched_groups:
+                    n_batch = bg['n_batch']
 
-                # Output Hadamard with this projection's svh slice
-                proj_svh = svh.narrow(0, out_offset, proj_size)
-                proj_out_h = out_h.narrow(1, out_offset, proj_size)
-                had_r_128(proj_out, proj_out_h, None, proj_svh, 1.0)
+                    # Input Hadamard per sub-projection
+                    xh_batched = torch.empty(
+                        (n_batch, M, K), dtype=x_2d.dtype,
+                        device=x_2d.device)
+                    for j, i in enumerate(bg['indices']):
+                        had_r_128(
+                            x_2d, xh_batched[j], suh[i], None, 1.0)
 
-                tile_offset += proj_tiles
-                out_offset += proj_size
+                    # Single batched GEMM launch
+                    out_batched = exl3_multi_gemm(
+                        xh_batched, bg['B_stacked_i32'],
+                        n_batch, bits=bits, cb=cb,
+                    )
+
+                    # Output Hadamard per sub-projection
+                    for j, i in enumerate(bg['indices']):
+                        o_off = bg['out_offsets'][j]
+                        proj_svh = svh.narrow(0, o_off, bg['proj_N'])
+                        proj_out_h = out_h.narrow(
+                            1, o_off, bg['proj_N'])
+                        had_r_128(
+                            out_batched[j], proj_out_h,
+                            None, proj_svh, 1.0)
+            else:
+                # Sequential fallback (EXL3_MULTI_GEMM=0)
+                tile_offset = 0
+                out_offset = 0
+                for i in range(num_proj):
+                    proj_suh = suh[i]
+                    proj_size = output_partition_sizes[i]
+                    proj_tiles = proj_size // 16
+
+                    xh = torch.empty_like(x_2d)
+                    had_r_128(x_2d, xh, proj_suh, None, 1.0)
+
+                    proj_trellis = trellis.narrow(
+                        1, tile_offset, proj_tiles)
+                    proj_trellis_i32 = proj_trellis.contiguous().view(
+                        torch.int32)
+
+                    proj_out = exl3_gemm(
+                        xh, proj_trellis, bits=bits, cb=cb,
+                        B_i32=proj_trellis_i32,
+                    )
+
+                    proj_svh = svh.narrow(0, out_offset, proj_size)
+                    proj_out_h = out_h.narrow(1, out_offset, proj_size)
+                    had_r_128(
+                        proj_out, proj_out_h, None, proj_svh, 1.0)
+
+                    tile_offset += proj_tiles
+                    out_offset += proj_size
 
         if bias is not None:
             out_h = out_h + bias
@@ -926,8 +1135,25 @@ class EXL3EmbeddingMethod(QuantizeMethodBase):
         layer.register_parameter("suh", suh)
         layer.register_parameter("svh", svh)
 
+        # Register codebook marker dummy param (mcg/mul1)
+        self._register_cb_dummy(layer, exl3_loader)
+
         layer.exl3_bits = self.bits
+        layer.exl3_cb = self.quant_config.cb
         layer._exl3_dequant = False
+
+    def _register_cb_dummy(self, layer, weight_loader):
+        """Register a codebook marker dummy parameter if cb != 0."""
+        cb = self.quant_config.cb
+        cb_names = {1: "mcg", 2: "mul1"}
+        if cb in cb_names:
+            name = cb_names[cb]
+            dummy = BasevLLMParameter(
+                data=torch.zeros(1, dtype=torch.int32),
+                weight_loader=weight_loader,
+            )
+            dummy._exl3_cb_dummy = True
+            layer.register_parameter(name, dummy)
 
     def _create_weights_dequant(
         self,
@@ -987,7 +1213,11 @@ class EXL3EmbeddingMethod(QuantizeMethodBase):
         layer.register_parameter("suh", suh)
         layer.register_parameter("svh", svh)
 
+        # Register codebook marker dummy param (mcg/mul1)
+        self._register_cb_dummy(layer, exl3_loader)
+
         layer.exl3_bits = self.bits
+        layer.exl3_cb = self.quant_config.cb
         layer._exl3_dequant = True
         layer._exl3_dequant_full_output_sizes = full_output_partition_sizes
         layer._exl3_dequant_input_size = input_size
@@ -1043,6 +1273,7 @@ class EXL3EmbeddingMethod(QuantizeMethodBase):
         suh = layer.suh.data
         svh = layer.svh.data
         bits = layer.exl3_bits
+        cb = getattr(layer, 'exl3_cb', 0)
         full_output_sizes = layer._exl3_dequant_full_output_sizes
         tp_size = layer._exl3_dequant_tp_size
         tp_rank = get_tensor_model_parallel_rank()
@@ -1069,7 +1300,7 @@ class EXL3EmbeddingMethod(QuantizeMethodBase):
             had_r_128(eye_block, xh, suh, None, 1.0)
 
             proj_out = exl3_gemm(
-                xh, trellis, bits=bits, cb=0, B_i32=trellis_i32,
+                xh, trellis, bits=bits, cb=cb, B_i32=trellis_i32,
             )
 
             proj_out_h = torch.empty_like(proj_out)
@@ -1135,7 +1366,8 @@ class EXL3EmbeddingMethod(QuantizeMethodBase):
         had_r_128(x_2d, xh, layer.suh, None, 1.0)
 
         out = exl3_gemm(
-            xh, layer.trellis, bits=layer.exl3_bits, cb=0,
+            xh, layer.trellis, bits=layer.exl3_bits,
+            cb=getattr(layer, 'exl3_cb', 0),
             B_i32=layer.trellis_i32,
         )
 
@@ -1278,7 +1510,8 @@ def _load_moe_svh(
         param.data[expert_id].copy_(loaded_weight)
 
 
-def _dequant_expert_weights(trellis, trellis_i32, suh, svh, K, N, bits):
+def _dequant_expert_weights(trellis, trellis_i32, suh, svh, K, N, bits,
+                            cb=0):
     """Dequant all experts: trellis → (E, K, N) FP16 via identity-matrix pipeline.
 
     Args:
@@ -1289,6 +1522,7 @@ def _dequant_expert_weights(trellis, trellis_i32, suh, svh, K, N, bits):
         K: input dimension
         N: output dimension
         bits: quantization bits
+        cb: codebook index (0=3inst, 1=mcg, 2=mul1)
 
     Returns:
         (E, K, N) fp16 row-major weight tensor
@@ -1317,7 +1551,7 @@ def _dequant_expert_weights(trellis, trellis_i32, suh, svh, K, N, bits):
 
             # GEMM
             proj = exl3_gemm(
-                xh, trellis[e], bits=bits, cb=0,
+                xh, trellis[e], bits=bits, cb=cb,
                 B_i32=trellis_i32[e],
             )
 
@@ -1483,6 +1717,30 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         })
 
         layer.exl3_bits = bits
+        layer.exl3_cb = self.quant_config.cb
+
+        # Register codebook marker dummy params (mcg/mul1) for MoE.
+        # Expert mapping converts "experts.5.gate_proj." → "experts.w13_",
+        # so "experts.5.gate_proj.mcg" → "experts.w13_mcg". We need both
+        # w13_<cb> and w2_<cb> registered.
+        cb = self.quant_config.cb
+        cb_names = {1: "mcg", 2: "mul1"}
+        if cb in cb_names:
+            name = cb_names[cb]
+            def _make_cb_dummy_loader():
+                def _cb_loader(param, loaded_weight, weight_name,
+                               shard_id, expert_id):
+                    pass  # Silently absorb
+                return _cb_loader
+            for prefix in ("w13_", "w2_"):
+                dummy = torch.nn.Parameter(
+                    torch.zeros(1, dtype=torch.int32),
+                    requires_grad=False,
+                )
+                layer.register_parameter(f"{prefix}{name}", dummy)
+                set_weight_attrs(dummy, {
+                    "weight_loader": _make_cb_dummy_loader(),
+                })
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         bits = layer.exl3_bits
@@ -1548,13 +1806,14 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         dummy_suh = layer.w13_suh[0, 0]  # (K,)
         had_r_128(dummy_x, dummy_h, dummy_suh, None, 1.0)
         # Gate/Up GEMM: (1, K) -> (1, N)
-        exl3_gemm(dummy_h, layer.w1_trellis[0], bits=bits, cb=0,
+        cb = layer.exl3_cb
+        exl3_gemm(dummy_h, layer.w1_trellis[0], bits=bits, cb=cb,
                   B_i32=layer.w1_trellis_i32[0])
         # Down GEMM: (1, N) -> (1, K)
         dummy_n = torch.zeros(1, N, dtype=torch.float16, device=device)
         dummy_nh = torch.empty_like(dummy_n)
         had_r_128(dummy_n, dummy_nh, layer.w2_suh[0], None, 1.0)
-        exl3_gemm(dummy_nh, layer.w2_trellis[0], bits=bits, cb=0,
+        exl3_gemm(dummy_nh, layer.w2_trellis[0], bits=bits, cb=cb,
                   B_i32=layer.w2_trellis_i32[0])
         # Had on output shapes
         dummy_gate = torch.zeros(1, N, dtype=torch.float16, device=device)
@@ -1577,11 +1836,12 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
                 layer.w1_trellis.shape[0], K, N_gate, N_gate, K)
 
             # Gate: (E, K) -> (E, K, N_gate)
+            cb = layer.exl3_cb
             layer.w1_fp16 = torch.nn.Parameter(
                 _dequant_expert_weights(
                     layer.w1_trellis, layer.w1_trellis_i32,
                     layer.w13_suh[:, 0, :], layer.w1_svh,
-                    K, N_gate, bits,
+                    K, N_gate, bits, cb=cb,
                 ),
                 requires_grad=False,
             )
@@ -1590,7 +1850,7 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
                 _dequant_expert_weights(
                     layer.w3_trellis, layer.w3_trellis_i32,
                     layer.w13_suh[:, 1, :], layer.w3_svh,
-                    K, N_gate, bits,
+                    K, N_gate, bits, cb=cb,
                 ),
                 requires_grad=False,
             )
@@ -1599,7 +1859,7 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
                 _dequant_expert_weights(
                     layer.w2_trellis, layer.w2_trellis_i32,
                     layer.w2_suh, layer.w2_svh,
-                    N_gate, K, bits,
+                    N_gate, K, bits, cb=cb,
                 ),
                 requires_grad=False,
             )
@@ -1629,12 +1889,14 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
                 num_m_blocks_warmup = EM_warmup // BLOCK_M
                 # Gate/Up shape
                 tiles_k_gu = K // 16
-                sk_gu = _hip_moe_auto_split_k(num_m_blocks_warmup, tiles_k_gu)
+                sk_gu = _hip_moe_auto_split_k(num_m_blocks_warmup, tiles_k_gu,
+                                               is_decode=True)
                 if sk_gu > 1:
                     _get_hip_moe_splitk_buf(sk_gu, EM_warmup, N, device)
                 # Down shape
                 tiles_k_dn = N // 16
-                sk_dn = _hip_moe_auto_split_k(num_m_blocks_warmup, tiles_k_dn)
+                sk_dn = _hip_moe_auto_split_k(num_m_blocks_warmup, tiles_k_dn,
+                                               is_decode=True)
                 if sk_dn > 1:
                     _get_hip_moe_splitk_buf(sk_dn, EM_warmup, K, device)
                 logger.info(
@@ -1664,7 +1926,7 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
             _fused_moe_had_impl(
                 dummy_a_k, layer.w1_trellis,
                 dummy_sorted, dummy_eid, dummy_npp,
-                layer.w1_svh, EM_max=EM_warmup, bits=bits, cb=0,
+                layer.w1_svh, EM_max=EM_warmup, bits=bits, cb=cb,
                 B_i32=layer.w1_trellis_i32)
             # Down: (1, N) -> (EM, K_out)
             dummy_a_n = torch.zeros(
@@ -1672,13 +1934,13 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
             _fused_moe_had_impl(
                 dummy_a_n, layer.w2_trellis,
                 dummy_sorted, dummy_eid, dummy_npp,
-                layer.w2_svh, EM_max=EM_warmup, bits=bits, cb=0,
+                layer.w2_svh, EM_max=EM_warmup, bits=bits, cb=cb,
                 B_i32=layer.w2_trellis_i32)
 
     def get_fused_moe_quant_config(self, layer):
         return None
 
-    def _apply_expert(self, layer, token, eid, bits, exl3_gemm, had_r_128):
+    def _apply_expert(self, layer, token, eid, bits, cb, exl3_gemm, had_r_128):
         """Run token(s) through one expert using Python int eid indexing.
 
         Used in eager path and all-experts graph capture path where eid
@@ -1689,7 +1951,7 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         xh = torch.empty_like(token)
         had_r_128(token, xh, layer.w13_suh[eid, 0], None, 1.0)
         gate = exl3_gemm(
-            xh, layer.w1_trellis[eid], bits=bits, cb=0,
+            xh, layer.w1_trellis[eid], bits=bits, cb=cb,
             B_i32=layer.w1_trellis_i32[eid],
         )
         gate_h = torch.empty_like(gate)
@@ -1699,7 +1961,7 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         xh_up = torch.empty_like(token)
         had_r_128(token, xh_up, layer.w13_suh[eid, 1], None, 1.0)
         up = exl3_gemm(
-            xh_up, layer.w3_trellis[eid], bits=bits, cb=0,
+            xh_up, layer.w3_trellis[eid], bits=bits, cb=cb,
             B_i32=layer.w3_trellis_i32[eid],
         )
         up_h = torch.empty_like(up)
@@ -1712,7 +1974,7 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         xh_down = torch.empty_like(hidden)
         had_r_128(hidden, xh_down, layer.w2_suh[eid], None, 1.0)
         down = exl3_gemm(
-            xh_down, layer.w2_trellis[eid], bits=bits, cb=0,
+            xh_down, layer.w2_trellis[eid], bits=bits, cb=cb,
             B_i32=layer.w2_trellis_i32[eid],
         )
         down_h = torch.empty_like(down)
@@ -1722,7 +1984,7 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
     def _apply_expert_gathered(self, token, w13_suh_e, w1_trellis_e,
                                w1_svh_e, w3_trellis_e, w3_svh_e,
                                w2_suh_e, w2_trellis_e, w2_svh_e,
-                               bits, exl3_gemm, had_r_128):
+                               bits, cb, exl3_gemm, had_r_128):
         """Run token(s) through one expert using pre-gathered weights.
 
         Used in per-slot graph capture path. Weights are already gathered
@@ -1733,7 +1995,7 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         xh = torch.empty_like(token)
         had_r_128(token, xh, w13_suh_e[0], None, 1.0)
         gate = exl3_gemm(
-            xh, w1_trellis_e, bits=bits, cb=0,
+            xh, w1_trellis_e, bits=bits, cb=cb,
             B_i32=w1_trellis_e.view(torch.int32),
         )
         gate_h = torch.empty_like(gate)
@@ -1743,7 +2005,7 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         xh_up = torch.empty_like(token)
         had_r_128(token, xh_up, w13_suh_e[1], None, 1.0)
         up = exl3_gemm(
-            xh_up, w3_trellis_e, bits=bits, cb=0,
+            xh_up, w3_trellis_e, bits=bits, cb=cb,
             B_i32=w3_trellis_e.view(torch.int32),
         )
         up_h = torch.empty_like(up)
@@ -1756,7 +2018,7 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         xh_down = torch.empty_like(hidden)
         had_r_128(hidden, xh_down, w2_suh_e, None, 1.0)
         down = exl3_gemm(
-            xh_down, w2_trellis_e, bits=bits, cb=0,
+            xh_down, w2_trellis_e, bits=bits, cb=cb,
             B_i32=w2_trellis_e.view(torch.int32),
         )
         down_h = torch.empty_like(down)
@@ -1784,6 +2046,7 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         )
 
         bits = layer.exl3_bits
+        cb = getattr(layer, 'exl3_cb', 0)
         M, K = x.shape[0], x.shape[-1]
         top_k = topk_ids.shape[1]
         num_experts = layer.w1_trellis.shape[0]
@@ -1851,14 +2114,14 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
             gate_h = exl3_fused_moe_gemm(
                 x_sorted, layer.w1_trellis,
                 identity_ids, eid_blocks,
-                num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
+                num_post_pad_t, EM_max=EM_max, bits=bits, cb=cb,
                 B_i32=layer.w1_trellis_i32,
                 B_fp16=w1_fp16)
 
             up_h = exl3_fused_moe_gemm(
                 x_sorted, layer.w3_trellis,
                 identity_ids, eid_blocks,
-                num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
+                num_post_pad_t, EM_max=EM_max, bits=bits, cb=cb,
                 B_i32=layer.w3_trellis_i32,
                 B_fp16=w3_fp16)
 
@@ -1867,11 +2130,11 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
             down_h = exl3_fused_moe_gemm(
                 hidden, layer.w2_trellis,
                 identity_ids, eid_blocks,
-                num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
+                num_post_pad_t, EM_max=EM_max, bits=bits, cb=cb,
                 B_i32=layer.w2_trellis_i32,
                 B_fp16=w2_fp16)
-        elif _USE_MOE_COMPOUND_V2:
-            # V2: Zero-allocation compound Had→GEMM→Had.
+        elif _USE_MOE_COMPOUND_V2 and cb == 0:
+            # V2: Zero-allocation compound Had→GEMM→Had (cb=0 only — HIP).
             # 4 graph nodes per MoE layer (gate, up, silu_mul, down).
             # ALL buffers allocated here (visible to torch.compile memory
             # planner → CUDA graph memory pool) and passed in via mutates_args.
@@ -1884,12 +2147,14 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
 
             # Compute split-K for gate/up (K_in=K → N=N_inter)
             num_k_tiles_gu = K // 16
-            split_k_gu = _hip_moe_auto_split_k(num_m_blocks, num_k_tiles_gu)
+            split_k_gu = _hip_moe_auto_split_k(num_m_blocks, num_k_tiles_gu,
+                                               is_decode=False)
             split_k_gu = min(split_k_gu, num_k_tiles_gu)
 
             # Compute split-K for down (K_in=N_inter → N=K)
             num_k_tiles_dn = N_inter // 16
-            split_k_dn = _hip_moe_auto_split_k(num_m_blocks, num_k_tiles_dn)
+            split_k_dn = _hip_moe_auto_split_k(num_m_blocks, num_k_tiles_dn,
+                                               is_decode=False)
             split_k_dn = min(split_k_dn, num_k_tiles_dn)
 
             # Scratch buffers for gate/up (reusable — sequential, not concurrent)
@@ -1901,6 +2166,7 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
                 buf_Cp_gu = _get_moe_scratch_buf(
                     "Cp_gu", split_k_gu * EM_max, N_inter, x.device
                 ).view(split_k_gu, EM_max, N_inter)
+                buf_Cp_gu.zero_()
             else:
                 buf_Cp_gu = torch.empty(
                     1, 1, 1, dtype=torch.float16, device=x.device)
@@ -1938,6 +2204,7 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
                 buf_Cp_dn = _get_moe_scratch_buf(
                     "Cp_dn", split_k_dn * EM_max, N_out, x.device
                 ).view(split_k_dn, EM_max, N_out)
+                buf_Cp_dn.zero_()
             else:
                 buf_Cp_dn = torch.empty(
                     1, 1, 1, dtype=torch.float16, device=x.device)
@@ -1952,9 +2219,10 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
 
             down_h = down_out
 
-        elif _USE_MOE_COMPOUND:
-            # V7/V8: Compound Had→GEMM→Had (allocates internally — legacy).
-            # Superseded by V2 above. Kept for fallback / A-B testing.
+        elif _USE_MOE_COMPOUND and M > 1 and cb == 0:
+            # V7/V8: Compound Had→GEMM→Had — prefill only (M>1), cb=0 only (HIP).
+            # Reduces Python dispatch overhead: 2 ops/layer vs 10+.
+            # Decode (M=1) uses legacy path below for CUDA graph compatibility.
             hidden = exl3_fused_moe_gate_up(
                 x_sorted,
                 layer.w13_suh_gate, layer.w13_suh_up,
@@ -1993,13 +2261,13 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
                     xh_gate, layer.w1_trellis,
                     identity_ids, eid_blocks,
                     num_post_pad_t, layer.w1_svh,
-                    EM_max=EM_max, bits=bits, cb=0,
+                    EM_max=EM_max, bits=bits, cb=cb,
                     B_i32=layer.w1_trellis_i32)
             else:
                 gate = exl3_fused_moe_gemm(
                     xh_gate, layer.w1_trellis,
                     identity_ids, eid_blocks,
-                    num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
+                    num_post_pad_t, EM_max=EM_max, bits=bits, cb=cb,
                     B_i32=layer.w1_trellis_i32)
                 gate_h = batched_had_r_128(
                     gate, layer.w1_svh,
@@ -2011,13 +2279,13 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
                     xh_up, layer.w3_trellis,
                     identity_ids, eid_blocks,
                     num_post_pad_t, layer.w3_svh,
-                    EM_max=EM_max, bits=bits, cb=0,
+                    EM_max=EM_max, bits=bits, cb=cb,
                     B_i32=layer.w3_trellis_i32)
             else:
                 up = exl3_fused_moe_gemm(
                     xh_up, layer.w3_trellis,
                     identity_ids, eid_blocks,
-                    num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
+                    num_post_pad_t, EM_max=EM_max, bits=bits, cb=cb,
                     B_i32=layer.w3_trellis_i32)
                 up_h = batched_had_r_128(
                     up, layer.w3_svh,
@@ -2034,13 +2302,13 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
                     xh_down, layer.w2_trellis,
                     identity_ids, eid_blocks,
                     num_post_pad_t, layer.w2_svh,
-                    EM_max=EM_max, bits=bits, cb=0,
+                    EM_max=EM_max, bits=bits, cb=cb,
                     B_i32=layer.w2_trellis_i32)
             else:
                 down = exl3_fused_moe_gemm(
                     xh_down, layer.w2_trellis,
                     identity_ids, eid_blocks,
-                    num_post_pad_t, EM_max=EM_max, bits=bits, cb=0,
+                    num_post_pad_t, EM_max=EM_max, bits=bits, cb=cb,
                     B_i32=layer.w2_trellis_i32)
                 down_h = batched_had_r_128(
                     down, layer.w2_svh,

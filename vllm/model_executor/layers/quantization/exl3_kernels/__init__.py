@@ -18,6 +18,7 @@ from vllm.model_executor.layers.quantization.exl3_kernels.triton_kernel import (
     exl3_fused_moe_gemm as _exl3_fused_moe_gemm_impl,
     exl3_fused_moe_gemm_had as _exl3_fused_moe_gemm_had_impl,
     exl3_gemm as _exl3_gemm_impl,
+    exl3_multi_gemm as _exl3_multi_gemm_impl,
     exl3_trellis_to_fp16,
     get_bit_tables,
 )
@@ -34,6 +35,12 @@ _HAS_HIP_MOE = False
 _hip_ext = None
 
 _HAS_HIP_MOE_FP16 = False
+
+# V4 VALU kernel: register-only M=1 decode, no WMMA overhead
+# EXL3_HIP_GEMM_V4=1 (default ON) or =0 to force MoE-based dense path
+_USE_HIP_V4 = os.environ.get("EXL3_HIP_GEMM_V4", "1") == "1"
+_HAS_HIP_V4 = False
+_HAS_HIP_BATCHED_V4 = False
 
 # v3 pipelined kernel toggle: EXL3_HIP_GEMM_V3=0 (default OFF) or =1 to enable
 # v3 dense GEMM regresses attention layers (+0.7 tok/s when disabled).
@@ -64,6 +71,15 @@ if _USE_HIP_MOE_GEMM:
             _hip_ext is not None
             and hasattr(_hip_ext, 'exl3_fused_moe_gemm_fp16')
         )
+        if _USE_HIP_V4:
+            _HAS_HIP_V4 = (
+                _hip_ext is not None
+                and hasattr(_hip_ext, 'exl3_gemm_v4')
+            )
+            _HAS_HIP_BATCHED_V4 = (
+                _hip_ext is not None
+                and hasattr(_hip_ext, 'exl3_batched_gemm_v4')
+            )
         if _USE_HIP_V3:
             _HAS_HIP_V3 = (
                 _hip_ext is not None
@@ -146,10 +162,15 @@ def _get_hip_moe_output_buf(EM, N, device):
     return buf[:EM]
 
 
-def _hip_moe_auto_split_k(num_m_blocks, num_k_tiles):
-    """Auto split-K selection for HIP MoE GEMM."""
+def _hip_moe_auto_split_k(num_m_blocks, num_k_tiles, is_decode=False):
+    """Auto split-K selection for HIP MoE GEMM.
+
+    Decode (few M-blocks): higher split-K (max 8) for K-parallelism.
+    Prefill (many M-blocks): lower split-K (max 4), M-parallelism suffices.
+    """
     if num_m_blocks <= 16 and num_k_tiles >= 16:
-        return min(8, num_k_tiles)
+        max_sk = 8 if is_decode else 4
+        return min(max_sk, num_k_tiles)
     return 1
 
 
@@ -160,7 +181,7 @@ def _hip_moe_auto_split_k(num_m_blocks, num_k_tiles):
 # ---------------------------------------------------------------------------
 # Default OFF: only 5µs/kernel faster in CUDA graph replay (28.8→23.7µs),
 # total savings ~0.6ms/step — not worth the code complexity.
-_USE_HIP_DENSE_GEMM = os.environ.get("EXL3_HIP_DENSE_GEMM", "0") == "1"
+_USE_HIP_DENSE_GEMM = os.environ.get("EXL3_HIP_DENSE_GEMM", "1") == "1"
 
 # Cached routing tensors for dense GEMM (single M-block, expert 0)
 _hip_dense_routing: dict = {}  # {device: (expert_ids, num_tokens_post_padded)}
@@ -208,6 +229,37 @@ def _get_hip_dense_splitk_buf(split_k, N, device):
     return buf
 
 
+# Cached split-K partial buffer for V4 GEMM: {(device, split_k, N): tensor}
+_hip_v4_splitk_buf: dict = {}
+
+
+def _get_hip_v4_splitk_buf(split_k, N, device):
+    """Get or allocate cached C_partial for HIP V4 split-K (M=1)."""
+    key = (device, split_k, N)
+    buf = _hip_v4_splitk_buf.get(key)
+    if buf is None:
+        buf = torch.empty(
+            (split_k, 1, N), dtype=torch.float16, device=device)
+        _hip_v4_splitk_buf[key] = buf
+    return buf
+
+
+# Cached split-K partial buffer for batched V4: {(device, split_k, MN): tensor}
+_hip_batched_v4_splitk_buf: dict = {}
+
+
+def _get_hip_batched_v4_splitk_buf(split_k, num_outputs, N, device):
+    """Get or allocate cached C_partial for batched V4 split-K."""
+    MN = num_outputs * N
+    key = (device, split_k, MN)
+    buf = _hip_batched_v4_splitk_buf.get(key)
+    if buf is None:
+        buf = torch.empty(
+            (split_k, MN), dtype=torch.float16, device=device)
+        _hip_batched_v4_splitk_buf[key] = buf
+    return buf
+
+
 # ---------------------------------------------------------------------------
 # Register exl3_gemm as a custom op for torch.compile compatibility.
 # ---------------------------------------------------------------------------
@@ -223,9 +275,32 @@ def _exl3_gemm_op(
     M, K = A.shape
     N = B_packed.shape[1] * 16
 
+    # HIP V4 VALU kernel: register-only M=1 decode, no WMMA overhead.
+    # ~1.3-1.8x faster than V2 MoE-based dense path.
+    if (_HAS_HIP_V4 and M == 1 and cb in (0, 1)
+            and K % 16 == 0 and N % 16 == 0):
+        word_idx, next_word_idx, shift_tbl = get_bit_tables(bits, A.device)
+        num_k_tiles = K // 16
+        split_k = min(8, num_k_tiles)
+
+        C = torch.empty(1, N, dtype=torch.float16, device=A.device)
+
+        if split_k > 1:
+            C_partial = _get_hip_v4_splitk_buf(split_k, N, A.device)
+        else:
+            C_partial = torch.empty(
+                1, 1, 1, dtype=torch.float16, device=A.device)
+
+        _hip_ext.exl3_gemm_v4(
+            A, B_i32, C,
+            word_idx, next_word_idx, shift_tbl,
+            bits, cb, split_k, C_partial,
+        )
+        return C
+
     # HIP v2 dense GEMM: reuse MoE kernel with 1 expert, BLOCK_M=16
-    # Only for M=1 decode (most common case) and cb=0
-    if (_USE_HIP_DENSE_GEMM and _HAS_HIP_MOE and M == 1 and cb == 0
+    # Only for M=1 decode (most common case) and cb=0,1
+    if (_USE_HIP_DENSE_GEMM and _HAS_HIP_MOE and M == 1 and cb in (0, 1)
             and K % 16 == 0 and N % 16 == 0):
         word_idx, next_word_idx, shift_tbl = get_bit_tables(bits, A.device)
         expert_ids, num_post = _get_hip_dense_routing(A.device)
@@ -238,15 +313,17 @@ def _exl3_gemm_op(
         B_e = B_i32.unsqueeze(0)
 
         num_k_tiles = K // 16
-        split_k = _hip_moe_auto_split_k(1, num_k_tiles)
+        split_k = _hip_moe_auto_split_k(1, num_k_tiles, is_decode=True)
         split_k = min(split_k, num_k_tiles)
 
-        C = _get_hip_moe_output_buf(BLOCK_M_DENSE, N, A.device)
+        C = torch.empty(BLOCK_M_DENSE, N, dtype=torch.float16,
+                        device=A.device)
 
         if split_k > 1:
             # Dedicated small buffer — MoE buffers may have larger EM_max
             # which makes slices non-contiguous
             C_partial = _get_hip_dense_splitk_buf(split_k, N, A.device)
+            C_partial.zero_()
         else:
             C_partial = torch.empty(
                 1, 1, 1, dtype=torch.float16, device=A.device)
@@ -255,12 +332,12 @@ def _exl3_gemm_op(
             A_padded, B_e, C,
             expert_ids, num_post,
             word_idx, next_word_idx, shift_tbl,
-            BLOCK_M_DENSE, bits, 0, split_k, C_partial,
+            BLOCK_M_DENSE, bits, cb, split_k, C_partial,
         )
         return C[:1]  # Return only first row
 
     # v3 pipelined HIP kernel: 4-wave (N=64 per block), lock-based split-K
-    if _HAS_HIP_V3 and N % 64 == 0 and cb == 0:
+    if _HAS_HIP_V3 and N % 64 == 0 and cb in (0, 1):
         C = torch.empty(M, N, dtype=torch.float16, device=A.device)
         word_idx, next_word_idx, shift_tbl = get_bit_tables(bits, A.device)
 
@@ -322,6 +399,94 @@ def exl3_gemm(
 
 
 # ---------------------------------------------------------------------------
+# Register exl3_multi_gemm as a custom op for torch.compile compatibility.
+# Batches multiple matching-N GEMMs into one launch for merged layers.
+# ---------------------------------------------------------------------------
+
+def _exl3_multi_gemm_op(
+    A_batched: torch.Tensor,
+    B_stacked_i32: torch.Tensor,
+    num_outputs: int,
+    bits: int,
+    cb: int,
+) -> torch.Tensor:
+    """Wrapper matching custom_op signature."""
+    M = A_batched.shape[1]
+    K = A_batched.shape[2]
+    N = B_stacked_i32.shape[2] * 16
+
+    # Batched V4: single-launch HIP kernel for M=1 decode
+    if (_HAS_HIP_BATCHED_V4 and M == 1 and cb in (0, 1)
+            and K % 16 == 0 and N % 16 == 0):
+        word_idx, next_word_idx, shift_tbl = get_bit_tables(
+            bits, A_batched.device)
+        num_k_tiles = K // 16
+        split_k = min(8, num_k_tiles)
+        C = torch.empty(
+            num_outputs, 1, N, dtype=torch.float16, device=A_batched.device)
+        if split_k > 1:
+            C_partial = _get_hip_batched_v4_splitk_buf(
+                split_k, num_outputs, N, A_batched.device)
+        else:
+            C_partial = torch.empty(
+                1, 1, dtype=torch.float16, device=A_batched.device)
+        _hip_ext.exl3_batched_gemm_v4(
+            A_batched, B_stacked_i32, C,
+            word_idx, next_word_idx, shift_tbl,
+            num_outputs, bits, cb, split_k, C_partial)
+        return C
+
+    return _exl3_multi_gemm_impl(
+        A_batched, B_stacked_i32, num_outputs, bits=bits, cb=cb,
+    )
+
+
+def _exl3_multi_gemm_fake(
+    A_batched: torch.Tensor,
+    B_stacked_i32: torch.Tensor,
+    num_outputs: int,
+    bits: int,
+    cb: int,
+) -> torch.Tensor:
+    """Fake impl for Dynamo — returns correct shape."""
+    M = A_batched.shape[1]
+    N = B_stacked_i32.shape[2] * 16
+    return torch.empty(
+        (num_outputs, M, N), dtype=torch.float16, device=A_batched.device)
+
+
+direct_register_custom_op(
+    op_name="exl3_multi_gemm",
+    op_func=_exl3_multi_gemm_op,
+    mutates_args=[],
+    fake_impl=_exl3_multi_gemm_fake,
+)
+
+
+def exl3_multi_gemm(
+    A_batched: torch.Tensor,
+    B_stacked_i32: torch.Tensor,
+    num_outputs: int,
+    bits: int = 4,
+    cb: int = 0,
+) -> torch.Tensor:
+    """Batched EXL3 fused dequant + GEMM for multiple matching-N projections.
+
+    Args:
+        A_batched: (num_outputs, M, K) float16 input activations.
+        B_stacked_i32: (num_outputs, tiles_k, tiles_n, wpt) int32 packed weights.
+        num_outputs: Number of output matrices.
+        bits: Bits per weight (1-8).
+        cb: Codebook variant (0=default, 1=MCG, 2=MUL1).
+
+    Returns:
+        C: (num_outputs, M, N) float16.
+    """
+    return torch.ops.vllm.exl3_multi_gemm(
+        A_batched, B_stacked_i32, num_outputs, bits, cb)
+
+
+# ---------------------------------------------------------------------------
 # Register exl3_fused_moe_gemm as a custom op for torch.compile compatibility.
 # ---------------------------------------------------------------------------
 
@@ -332,6 +497,7 @@ def _exl3_fused_moe_gemm_hip(
     num_tokens_post_padded: torch.Tensor,
     EM_max: int,
     bits: int,
+    cb: int = 0,
     B_fp16: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dispatch fused MoE GEMM to HIP rocWMMA kernel.
@@ -348,15 +514,21 @@ def _exl3_fused_moe_gemm_hip(
     if B_fp16 is not None and _HAS_HIP_MOE_FP16:
         N = B_fp16.shape[2]
 
-        # Auto split-K
-        split_k = _hip_moe_auto_split_k(num_m_blocks, num_k_tiles)
-        split_k = min(split_k, num_k_tiles)
+        is_prefill = num_m_blocks > 64
 
-        C = _get_hip_moe_output_buf(EM_max, N, A.device)
+        # Auto split-K
+        split_k = _hip_moe_auto_split_k(num_m_blocks, num_k_tiles,
+                                         is_decode=not is_prefill)
+        split_k = min(split_k, num_k_tiles)
+        if is_prefill:
+            C = torch.zeros(EM_max, N, dtype=torch.float16, device=A.device)
+        else:
+            C = _get_hip_moe_output_buf(EM_max, N, A.device)
 
         if split_k > 1:
             C_partial = _get_hip_moe_splitk_buf(split_k, EM_max, N, A.device)
             C_partial = C_partial[:split_k, :EM_max, :N]
+            C_partial.zero_()
         else:
             C_partial = torch.empty(
                 1, 1, 1, dtype=torch.float16, device=A.device)
@@ -371,14 +543,13 @@ def _exl3_fused_moe_gemm_hip(
     # Dequant path: B_stacked_i32 is (E, tiles_k, tiles_n, WPT//2)
     N = B_stacked_i32.shape[2] * 16  # tiles_n * 16
 
-    # BLOCK_M=32 prefill path: 2× dequant reuse. DISABLED — benchmarks show
-    # no improvement because GPU hides dequant latency through block-level
-    # parallelism at prefill sizes (1280+ blocks across 64 SIMDs).
-    # Kept for future RDNA4 testing where block scheduling may differ.
-    # if _HAS_HIP_MOE_M64 and num_m_blocks >= 32:
-    #     return _exl3_fused_moe_gemm_hip_m64(
-    #         A, B_stacked_i32, expert_ids, num_tokens_post_padded,
-    #         EM_max, bits)
+    # BLOCK_M=64 prefill path: 4× dequant reuse via M64 kernel variant.
+    # Uses M_FACTOR=4 internally — dequants B once, reuses for 4 A sub-tiles.
+    # Best for small-to-medium prefills; v2 wins at large prefills (more parallelism).
+    if _HAS_HIP_MOE_M64 and 32 <= num_m_blocks <= 400:
+        return _exl3_fused_moe_gemm_hip_m64(
+            A, B_stacked_i32, expert_ids, num_tokens_post_padded,
+            EM_max, bits, cb)
 
     # Get bit extraction tables
     word_idx, next_word_idx, shift_tbl = get_bit_tables(bits, A.device)
@@ -387,17 +558,23 @@ def _exl3_fused_moe_gemm_hip(
     # (v3's 4-wave sync overhead hurts fused MoE more than it helps)
 
     # v2 path
-    # Auto split-K
-    split_k = _hip_moe_auto_split_k(num_m_blocks, num_k_tiles)
-    split_k = min(split_k, num_k_tiles)
+    # Prefill (many blocks): fresh torch.zeros — avoids stale data, OS zeroed pages cheap
+    # Decode (few blocks): cached buffer — avoids allocation overhead in CUDA graphs
+    is_prefill = num_m_blocks > 64
 
-    # Output buffer: kernel writes zeros on early-return for padding M-blocks,
-    # so no Python-side zero_() needed (saves ~1.8 tok/s in CUDA graphs).
-    C = _get_hip_moe_output_buf(EM_max, N, A.device)
+    # Auto split-K: decode gets max 8, prefill gets max 4
+    split_k = _hip_moe_auto_split_k(num_m_blocks, num_k_tiles,
+                                     is_decode=not is_prefill)
+    split_k = min(split_k, num_k_tiles)
+    if is_prefill:
+        C = torch.zeros(EM_max, N, dtype=torch.float16, device=A.device)
+    else:
+        C = _get_hip_moe_output_buf(EM_max, N, A.device)
 
     if split_k > 1:
         C_partial = _get_hip_moe_splitk_buf(split_k, EM_max, N, A.device)
         C_partial = C_partial[:split_k, :EM_max, :N]
+        C_partial.zero_()
     else:
         C_partial = torch.empty(1, 1, 1, dtype=torch.float16, device=A.device)
 
@@ -405,7 +582,7 @@ def _exl3_fused_moe_gemm_hip(
         A, B_stacked_i32, C,
         expert_ids, num_tokens_post_padded,
         word_idx, next_word_idx, shift_tbl,
-        EM_max, bits, 0,  # cb=0 always for HIP
+        EM_max, bits, cb,
         split_k, C_partial,
     )
     return C
@@ -418,6 +595,7 @@ def _exl3_fused_moe_gemm_hip_m64(
     num_tokens_post_padded: torch.Tensor,
     EM_max: int,
     bits: int,
+    cb: int = 0,
 ) -> torch.Tensor:
     """Dispatch fused MoE GEMM to HIP BLOCK_M=32 prefill kernel.
 
@@ -439,11 +617,12 @@ def _exl3_fused_moe_gemm_hip_m64(
     else:
         split_k = 1
 
-    C = _get_hip_moe_output_buf(EM_max, N, A.device)
+    C = torch.zeros(EM_max, N, dtype=torch.float16, device=A.device)
 
     if split_k > 1:
         C_partial = _get_hip_moe_splitk_buf(split_k, EM_max, N, A.device)
         C_partial = C_partial[:split_k, :EM_max, :N]
+        C_partial.zero_()
     else:
         C_partial = torch.empty(1, 1, 1, dtype=torch.float16, device=A.device)
 
@@ -451,7 +630,7 @@ def _exl3_fused_moe_gemm_hip_m64(
         A, B_stacked_i32, C,
         expert_ids, num_tokens_post_padded,
         word_idx, next_word_idx, shift_tbl,
-        EM_max, bits, 0,  # cb=0
+        EM_max, bits, cb,
         split_k, C_partial,
     )
     return C
@@ -477,10 +656,10 @@ def _exl3_fused_moe_gemm_op(
     """
     # B_fp16.numel() > 0 means FP16 weights are available
     has_fp16 = B_fp16.numel() > 0
-    if _HAS_HIP_MOE and cb == 0:
+    if _HAS_HIP_MOE and cb in (0, 1):
         return _exl3_fused_moe_gemm_hip(
             A, B_stacked_i32, expert_ids,
-            num_tokens_post_padded, EM_max, bits,
+            num_tokens_post_padded, EM_max, bits, cb,
             B_fp16=B_fp16 if has_fp16 else None,
         )
     return _exl3_fused_moe_gemm_impl(
@@ -618,6 +797,7 @@ def _exl3_fused_moe_gemm_had_hip(
     svh_stacked: torch.Tensor,
     EM_max: int,
     bits: int,
+    cb: int = 0,
 ) -> torch.Tensor:
     """Dispatch fused MoE GEMM+Had to HIP kernel."""
     K = A.shape[1]
@@ -628,18 +808,24 @@ def _exl3_fused_moe_gemm_had_hip(
     word_idx, next_word_idx, shift_tbl = get_bit_tables(bits, A.device)
     H16 = _get_h16_matrix(A.device)
 
-    # Auto split-K
-    split_k = _hip_moe_auto_split_k(num_m_blocks, num_k_tiles)
+    is_prefill = num_m_blocks > 64
+
+    # Auto split-K: decode gets max 8, prefill gets max 4
+    split_k = _hip_moe_auto_split_k(num_m_blocks, num_k_tiles,
+                                     is_decode=not is_prefill)
     split_k = min(split_k, num_k_tiles)
 
-    # Kernel writes zeros on early-return for padding M-blocks
-    C = _get_hip_moe_output_buf(EM_max, N, A.device)
+    if is_prefill:
+        C = torch.zeros(EM_max, N, dtype=torch.float16, device=A.device)
+    else:
+        C = _get_hip_moe_output_buf(EM_max, N, A.device)
 
     has_svh = 1 if svh_stacked.numel() > 0 else 0
 
     if split_k > 1:
         C_partial = _get_hip_moe_splitk_buf(split_k, EM_max, N, A.device)
         C_partial = C_partial[:split_k, :EM_max, :N]
+        C_partial.zero_()
     else:
         C_partial = torch.empty(1, 1, 1, dtype=torch.float16, device=A.device)
 
@@ -648,7 +834,7 @@ def _exl3_fused_moe_gemm_had_hip(
         expert_ids, num_tokens_post_padded,
         word_idx, next_word_idx, shift_tbl,
         H16, svh_stacked,
-        EM_max, bits, 0,  # cb=0 always for HIP
+        EM_max, bits, cb,
         split_k, has_svh, C_partial,
     )
     return C
@@ -671,11 +857,11 @@ def _exl3_fused_moe_gemm_had_op(
     otherwise falls back to Triton.
     """
     N = B_stacked_i32.shape[2] * 16
-    if _HAS_HIP_MOE_GEMM_HAD and cb == 0 and N % 128 == 0:
+    if _HAS_HIP_MOE_GEMM_HAD and cb in (0, 1) and N % 128 == 0:
         return _exl3_fused_moe_gemm_had_hip(
             A, B_stacked_i32, expert_ids,
             num_tokens_post_padded, svh_stacked,
-            EM_max, bits,
+            EM_max, bits, cb,
         )
     return _exl3_fused_moe_gemm_had_impl(
         A, B_stacked_i32.view(torch.int16),
