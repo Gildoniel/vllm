@@ -176,6 +176,21 @@ def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module],
 
     architectures = getattr(model_config.hf_config, "architectures", None) or []
 
+    # If architectures is empty (e.g. inner text_config of multimodal models),
+    # try to infer from model_type via transformers' auto mapping
+    if not architectures:
+        model_type = getattr(model_config.hf_config, "model_type", None)
+        if model_type:
+            try:
+                from transformers.models.auto.modeling_auto import (
+                    MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
+                )
+                arch_name = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.get(model_type)
+                if arch_name:
+                    architectures = [arch_name]
+            except ImportError:
+                pass
+
     model_cls, arch = model_config.registry.resolve_model_cls(
         architectures,
         model_config=model_config,
