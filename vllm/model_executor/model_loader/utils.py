@@ -188,6 +188,8 @@ def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module],
                 arch_name = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.get(model_type)
                 if arch_name:
                     architectures = [arch_name]
+                    # Set on hf_config so downstream code sees it too
+                    model_config.hf_config.architectures = architectures
             except ImportError:
                 pass
 
