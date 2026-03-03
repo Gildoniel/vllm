@@ -675,7 +675,7 @@ class ModelConfig:
         # Check if the architecture we're wrapping has defaults
         runner = None
         task = None
-        if defaults := try_match_architecture_defaults(self.architectures[0]):
+        if self.architectures and (defaults := try_match_architecture_defaults(self.architectures[0])):
             _, (runner, task) = defaults
         # User specified value take precedence
         if self.runner != "auto":
