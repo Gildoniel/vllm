@@ -2031,6 +2031,7 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
             moe_align_block_size,

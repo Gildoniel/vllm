@@ -214,7 +214,7 @@ def get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], 
             model_config.runner_type,
             model_config.trust_remote_code,
             model_config.model_impl,
-            tuple(getattr(model_config.hf_config, "architectures", [])),
+            tuple(getattr(model_config.hf_config, "architectures", None) or []),
         )
     )
     if key in _MODEL_ARCH_BY_HASH:
