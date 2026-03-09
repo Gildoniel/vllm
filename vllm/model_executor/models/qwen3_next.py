@@ -989,6 +989,13 @@ class Qwen3NextAttention(nn.Module):
         output[:], _ = self.o_proj(attn_output)
 
 
+
+def _dbg(msg):
+    import os, time
+    with open("/tmp/vllm_debug.log", "a") as f:
+        f.write(f"{time.time():.3f} pid={os.getpid()} {msg}\n")
+        f.flush()
+
 class Qwen3NextDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1078,6 +1085,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         positions: torch.Tensor = None,
         **kwargs: object,
     ):
+        _dbg(f"Layer{self.layer_idx} type={self.layer_type}")
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)

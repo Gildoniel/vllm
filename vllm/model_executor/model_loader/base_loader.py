@@ -21,6 +21,14 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 logger = init_logger(__name__)
 
 
+
+def _dbg(msg):
+    import os, time
+    with open("/tmp/vllm_debug.log", "a") as f:
+        f.write(f"{time.time():.3f} pid={os.getpid()} {msg}\n")
+        f.flush()
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
@@ -60,6 +68,7 @@ class BaseModelLoader(ABC):
             logger.debug("Loading weights on %s ...", load_device)
             # Quantization does not happen in `load_weights` but after it
             self.load_weights(model, model_config)
+            _dbg("base_loader: load_weights done")
 
             # Log peak GPU memory after loading weights. This is needed
             # to have test coverage on peak memory for online quantization.
@@ -71,7 +80,9 @@ class BaseModelLoader(ABC):
                     scope="local",
                 )
 
+            _dbg("base_loader: before process_weights_after_loading")
             process_weights_after_loading(model, model_config, target_device)
+            _dbg("base_loader: after process_weights_after_loading")
 
         return model.eval()
 

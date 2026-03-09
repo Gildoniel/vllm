@@ -381,6 +381,13 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
+
+def _dbg(msg):
+    import os, time
+    with open("/tmp/vllm_debug.log", "a") as f:
+        f.write(f"{time.time():.3f} pid={os.getpid()} {msg}\n")
+        f.flush()
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -4471,6 +4478,7 @@ class GPUModelRunner(
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config, model_config=self.model_config
                 )
+                _dbg(f"model_runner.load_model: model_loader DONE, model={type(self.model).__name__}")
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
@@ -4523,7 +4531,9 @@ class GPUModelRunner(
 
                     self.model.set_aux_hidden_state_layers(aux_layers)
                 time_after_load = time.perf_counter()
+                _dbg(f"model_runner.load_model: time_after_load done, exiting DeviceMemoryProfiler")
             self.model_memory_usage = m.consumed_memory
+            _dbg(f"model_runner.load_model: model_memory_usage={self.model_memory_usage}")
         except torch.cuda.OutOfMemoryError as e:
             msg = (
                 "Failed to load model - not enough GPU memory. "
@@ -4541,8 +4551,10 @@ class GPUModelRunner(
             time_after_load - time_before_load,
             scope="local",
         )
+        _dbg("model_runner.load_model: before prepare_communication_buffer")
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
+            _dbg("model_runner.load_model: after prepare_communication_buffer")
             if (drafter := getattr(self, "drafter", None)) and (
                 drafter_model := getattr(drafter, "model", None)
             ):
@@ -4554,6 +4566,7 @@ class GPUModelRunner(
             and mm_config.is_multimodal_pruning_enabled()
         )
 
+        _dbg("model_runner.load_model: before EPLB check")
         if (
             is_mixture_of_experts(self.model)
             and self.parallel_config.enable_eplb
@@ -4568,6 +4581,7 @@ class GPUModelRunner(
             if self.eplb_state.is_async:
                 self.eplb_state.start_async_loop()
 
+        _dbg("model_runner.load_model: before compilation check")
         if (
             self.vllm_config.compilation_config.mode
             == CompilationMode.STOCK_TORCH_COMPILE
@@ -4599,7 +4613,9 @@ class GPUModelRunner(
                     self.model, self.vllm_config, CUDAGraphMode.NONE, self.device
                 )
 
+        _dbg("model_runner.load_model: before get_offloader().post_init()")
         get_offloader().post_init()
+        _dbg("model_runner.load_model: DONE")
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
@@ -5179,6 +5195,7 @@ class GPUModelRunner(
                     slot_mapping=slot_mappings,
                 ),
             ):
+                _dbg("calling self.model() forward")
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -5186,6 +5203,7 @@ class GPUModelRunner(
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+                _dbg("self.model() forward DONE")
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
@@ -5427,6 +5445,7 @@ class GPUModelRunner(
 
     def profile_run(self) -> None:
         # Profile with multimodal encoder & encoder cache.
+        _dbg("profile_run ENTER")
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and mm_config.skip_mm_profiling:
@@ -5485,6 +5504,7 @@ class GPUModelRunner(
                             self.encoder_cache[f"tmp_{i}"] = output
 
         # Add `is_profile` here to pre-allocate communication buffers
+        _dbg("about to call _dummy_run")
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True
         )
@@ -6551,6 +6571,7 @@ class GPUModelRunner(
             )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        _dbg("get_kv_cache_spec ENTER")
         """
         Generates the KVCacheSpec by parsing the kv cache format from each
         Attention module in the static forward context.

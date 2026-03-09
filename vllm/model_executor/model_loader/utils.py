@@ -91,30 +91,40 @@ def initialize_model(
     return model
 
 
+
+def _dbg(msg):
+    import os, time
+    with open("/tmp/vllm_debug.log", "a") as f:
+        f.write(f"{time.time():.3f} pid={os.getpid()} {msg}\n")
+        f.flush()
+
+
 def process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
-    for _, module in model.named_modules():
+    _mod_count = 0
+    for _name, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
-            # When quant methods need to process weights after loading
-            # (for repacking, quantizing, etc), they expect parameters
-            # to be on the global target device. This scope is for the
-            # case where cpu offloading is used, where we will move the
-            # parameters onto device for processing and back off after.
+            _mod_count += 1
+            if _mod_count <= 5 or _mod_count % 50 == 0:
+                _dbg(f"process_weights: module {_mod_count} {_name} {type(quant_method).__name__}")
             with device_loading_context(module, target_device):
                 quant_method.process_weights_after_loading(module)
+    _dbg(f"process_weights: done quant loop, {_mod_count} modules")
 
     # Initialize post-load attention weights for both Attention and MLA.
-    # NOTE: Happens after other modules so we can easily decompress weights.
-    for _, module in model.named_modules():
+    _dbg("process_weights: starting attention loop")
+    _attn_count = 0
+    for _name, module in model.named_modules():
         if isinstance(module, (Attention, MLAAttention)) and hasattr(
             module, "process_weights_after_loading"
         ):
-            # TODO(lucas): see if there is a way to unify the signatures
-            # of process_weights_after_loading
+            _attn_count += 1
+            _dbg(f"process_weights: attn {_attn_count} {_name}")
             with device_loading_context(module, target_device):
                 module.process_weights_after_loading(model_config.dtype)
+    _dbg(f"process_weights: done attention loop, {_attn_count} modules")
 
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`

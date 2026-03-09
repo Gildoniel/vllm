@@ -115,11 +115,17 @@ def _make_exl3_weight_loader(linear_weight_loader, output_sizes):
 
 
 def _shard_idx(shard_id):
-    """Convert shard_id to integer index."""
+    """Convert shard_id to integer index.
+
+    Returns int for single shard, or (start, stop) tuple for fused
+    multi-shard weights (e.g. GDN in_proj_qkv -> (0, 3)).
+    """
     if shard_id is None:
         return None
     if isinstance(shard_id, str):
         return {"q": 0, "k": 1, "v": 2}[shard_id]
+    if isinstance(shard_id, tuple):
+        return (shard_id[0], shard_id[-1] + 1)
     return shard_id
 
 
@@ -164,8 +170,13 @@ def _load_trellis(param: "EXL3TrellisParameter", loaded_weight: torch.Tensor,
         return
 
     idx = _shard_idx(shard_id)
-    shard_offset = sum(output_sizes[:idx])
-    shard_size = output_sizes[idx]
+    # Fused multi-shard: idx is (start, stop) tuple
+    if isinstance(idx, tuple):
+        shard_offset = sum(output_sizes[:idx[0]])
+        shard_size = sum(output_sizes[idx[0]:idx[1]])
+    else:
+        shard_offset = sum(output_sizes[:idx])
+        shard_size = output_sizes[idx]
 
     tile_offset = shard_offset // 16
     tile_size = shard_size // 16
@@ -217,11 +228,27 @@ def _load_suh(param: "EXL3SuhParameter", loaded_weight: torch.Tensor,
     assert param.data.dim() == 2, (
         f"Merged suh must be 2D, got {param.data.shape}"
     )
-    assert param.data.shape[1] == loaded_weight.shape[0], (
-        f"suh dim mismatch: param row={param.data.shape[1]}, "
-        f"loaded={loaded_weight.shape[0]}"
-    )
-    param.data[idx].copy_(loaded_weight)
+    # Fused multi-shard: idx is (start, stop)
+    if isinstance(idx, tuple):
+        n_shards = idx[1] - idx[0]
+        if loaded_weight.dim() == 1:
+            # Shared suh across fused projections — broadcast to all rows
+            assert param.data.shape[1] == loaded_weight.shape[0], (
+                f"suh dim mismatch: param={param.data.shape[1]}, "
+                f"loaded={loaded_weight.shape[0]}")
+            for i in range(idx[0], idx[1]):
+                param.data[i].copy_(loaded_weight)
+        else:
+            assert param.data.shape[1] == loaded_weight.shape[1], (
+                f"suh dim mismatch: param={param.data.shape[1]}, "
+                f"loaded={loaded_weight.shape[1]}")
+            param.data[idx[0]:idx[1]].copy_(loaded_weight)
+    else:
+        assert param.data.shape[1] == loaded_weight.shape[0], (
+            f"suh dim mismatch: param row={param.data.shape[1]}, "
+            f"loaded={loaded_weight.shape[0]}"
+        )
+        param.data[idx].copy_(loaded_weight)
 
 
 def _load_svh(param: "EXL3ScaleParameter", loaded_weight: torch.Tensor,
@@ -250,8 +277,13 @@ def _load_svh(param: "EXL3ScaleParameter", loaded_weight: torch.Tensor,
         return
 
     idx = _shard_idx(shard_id)
-    shard_offset = sum(output_sizes[:idx])
-    shard_size = output_sizes[idx]
+    # Fused multi-shard: idx is (start, stop) tuple
+    if isinstance(idx, tuple):
+        shard_offset = sum(output_sizes[:idx[0]])
+        shard_size = sum(output_sizes[idx[0]:idx[1]])
+    else:
+        shard_offset = sum(output_sizes[:idx])
+        shard_size = output_sizes[idx]
 
     # output_sizes are already TP-divided (output_partition_sizes), so
     # shard_size and shard_offset are per-TP-rank values.  Index into
@@ -272,6 +304,14 @@ def _load_svh(param: "EXL3ScaleParameter", loaded_weight: torch.Tensor,
 # ---------------------------------------------------------------------------
 # Custom parameter classes
 # ---------------------------------------------------------------------------
+
+
+def _dbg(msg):
+    import os, time
+    with open("/tmp/vllm_debug.log", "a") as f:
+        f.write(f"{time.time():.3f} pid={os.getpid()} {msg}\n")
+        f.flush()
+
 
 class EXL3TrellisParameter(BasevLLMParameter):
     """3D trellis parameter (tiles_k, tiles_n, words_per_tile)."""
@@ -733,9 +773,12 @@ class EXL3LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, '_exl3_dequant', False):
+            _dbg(f"EXL3.pwl: dequant path")
             self._process_weights_dequant(layer)
+            _dbg(f"EXL3.pwl: dequant DONE")
             return
 
+        _dbg(f"EXL3.pwl: start normal path, bits={layer.exl3_bits}")
         trellis_data = layer.trellis.data
         layer.trellis = torch.nn.Parameter(trellis_data, requires_grad=False)
         layer.suh = torch.nn.Parameter(layer.suh.data, requires_grad=False)
@@ -743,6 +786,7 @@ class EXL3LinearMethod(LinearMethodBase):
 
         # Precompute int32 view for the Triton kernel
         layer.trellis_i32 = layer.trellis.data.view(torch.int32)
+        _dbg(f"EXL3.pwl: trellis_i32 done")
 
         # Eagerly populate device-side caches so that no CPU→CUDA copies
         # happen during CUDA graph capture.
@@ -753,8 +797,11 @@ class EXL3LinearMethod(LinearMethodBase):
         from vllm.model_executor.layers.quantization.exl3_kernels.hadamard import (
             _get_had128,
         )
+        _dbg(f"EXL3.pwl: before get_bit_tables")
         get_bit_tables(layer.exl3_bits, device)
+        _dbg(f"EXL3.pwl: before _get_had128")
         _get_had128(device)
+        _dbg(f"EXL3.pwl: caches done")
 
         # Pre-compute batched weight groups for merged layers (QKV, gate_up).
         # Groups sub-projections by matching N so they can be dispatched as
@@ -1407,6 +1454,7 @@ def _make_exl3_moe_weight_loader(
         weight_name: str,
         shard_id: str,
         expert_id: int,
+        **kwargs,
     ):
         # Map global expert_id to local for expert parallelism
         expert_map = getattr(moe_layer, "_expert_map", None)
@@ -1729,7 +1777,7 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
             name = cb_names[cb]
             def _make_cb_dummy_loader():
                 def _cb_loader(param, loaded_weight, weight_name,
-                               shard_id, expert_id):
+                               shard_id, expert_id, **kwargs):
                     pass  # Silently absorb
                 return _cb_loader
             for prefix in ("w13_", "w2_"):
@@ -2031,7 +2079,6 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
             moe_align_block_size,

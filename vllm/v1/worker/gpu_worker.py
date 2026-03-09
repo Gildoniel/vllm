@@ -70,6 +70,13 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
+def _dbg(msg):
+    import os, time
+    with open("/tmp/vllm_debug.log", "a") as f:
+        f.write(f"{time.time():.3f} pid={os.getpid()} {msg}\n")
+        f.flush()
+
+
 class AsyncIntermediateTensors(IntermediateTensors):
     """IntermediateTensors with lazy comm synchronization"""
 
@@ -332,11 +339,13 @@ class Worker(WorkerBase):
                 num_physical_experts - num_logical_experts
             )
 
+        _dbg(f"gpu_worker load_model START rank={self.rank}")
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
         ):
             self.model_runner.load_model(load_dummy_weights=dummy_weights)
+        _dbg(f"gpu_worker load_model DONE rank={self.rank}")
 
         if dummy_weights:
             self.model_runner.setup_eplb_from_mapping(
@@ -352,6 +361,7 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
+        _dbg("determine_available_memory ENTER")
         """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
 
