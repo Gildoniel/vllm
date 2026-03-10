@@ -32,8 +32,7 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fla.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
-)
-from vllm.model_executor.layers.fla.ops import (
+    fused_recurrent_gated_delta_rule,
     fused_sigmoid_gating_delta_rule_update,
 )
 from vllm.model_executor.layers.fla.ops.chunk import l2norm_fwd
@@ -990,12 +989,6 @@ class Qwen3NextAttention(nn.Module):
 
 
 
-def _dbg(msg):
-    import os, time
-    with open("/tmp/vllm_debug.log", "a") as f:
-        f.write(f"{time.time():.3f} pid={os.getpid()} {msg}\n")
-        f.flush()
-
 class Qwen3NextDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1085,7 +1078,6 @@ class Qwen3NextDecoderLayer(nn.Module):
         positions: torch.Tensor = None,
         **kwargs: object,
     ):
-        _dbg(f"Layer{self.layer_idx} type={self.layer_type}")
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
