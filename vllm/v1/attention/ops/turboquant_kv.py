@@ -575,6 +575,326 @@ def turboquant_decode_35(
 
 
 # ---------------------------------------------------------------------------
+# Phase 4: Fused Q·K^T score in WHT space (skip K dequant)
+# ---------------------------------------------------------------------------
+# score = norm_k * dot(WHT(q_normed), centroids[k_indices])
+# Rotate query once, dot directly with centroid lookups — no inverse WHT.
+# For GQA: q_heads_per_kv = num_q_heads // num_kv_heads
+
+@triton.jit
+def _tq_fused_qk_score_4bit_kernel(
+    # q_rot: [num_q_heads, head_dim] FP16 — WHT-rotated query (already scaled)
+    q_rot_ptr,
+    # packed_k: [num_kv_tokens, num_kv_heads, packed_dim] uint8
+    packed_k_ptr,
+    # norms_k: [num_kv_tokens, num_kv_heads] FP16
+    norms_k_ptr,
+    # scores_out: [num_q_heads, num_kv_tokens] FP32
+    scores_ptr,
+    # centroids: (16,) FP32
+    centroids_ptr,
+    # Strides
+    q_stride_head: tl.int64,
+    pk_stride_token: tl.int64,
+    pk_stride_head: tl.int64,
+    nk_stride_token: tl.int64,
+    sc_stride_head: tl.int64,
+    # Sizes
+    num_kv_tokens: tl.int32,
+    # Constants
+    HEAD_DIM: tl.constexpr,
+    PACKED_DIM: tl.constexpr,       # HEAD_DIM // 2
+    Q_HEADS_PER_KV: tl.constexpr,   # GQA ratio
+    BLOCK_KV: tl.constexpr,         # tokens per program
+):
+    """Fused Q·K^T score for 4-bit TQ cache — tiled over KV tokens.
+
+    Grid: (cdiv(num_kv_tokens, BLOCK_KV), num_q_heads)
+    Each program computes BLOCK_KV scores.
+    """
+    block_id = tl.program_id(0)
+    q_head = tl.program_id(1)
+    kv_head = q_head // Q_HEADS_PER_KV
+
+    kv_start = block_id * BLOCK_KV
+
+    # Load q_rot vector ONCE for this Q head — reuse across all BLOCK_KV tokens
+    q_offs = tl.arange(0, PACKED_DIM)
+    q_even = tl.load(q_rot_ptr + q_head * q_stride_head + q_offs * 2).to(tl.float32)
+    q_odd = tl.load(q_rot_ptr + q_head * q_stride_head + q_offs * 2 + 1).to(tl.float32)
+
+    # Preload all 16 centroids into registers
+    c_vals = tl.zeros((16,), dtype=tl.float32)
+    for c in tl.static_range(16):
+        c_vals = tl.where(tl.arange(0, 16) == c, tl.load(centroids_ptr + c).to(tl.float32), c_vals)
+
+    # Process BLOCK_KV tokens
+    for t in tl.static_range(BLOCK_KV):
+        kv_token = kv_start + t
+        if kv_token < num_kv_tokens:
+            pk_base = kv_token * pk_stride_token + kv_head * pk_stride_head
+            packed = tl.load(packed_k_ptr + pk_base + q_offs).to(tl.int32)
+            idx_even = packed & 0xF
+            idx_odd = (packed >> 4) & 0xF
+
+            # Vectorized centroid lookup
+            val_even = tl.zeros((PACKED_DIM,), dtype=tl.float32)
+            val_odd = tl.zeros((PACKED_DIM,), dtype=tl.float32)
+            for c in tl.static_range(16):
+                c_val = tl.load(centroids_ptr + c).to(tl.float32)
+                val_even = tl.where(idx_even == c, c_val, val_even)
+                val_odd = tl.where(idx_odd == c, c_val, val_odd)
+
+            dot = tl.sum(q_even * val_even) + tl.sum(q_odd * val_odd)
+            norm = tl.load(norms_k_ptr + kv_token * nk_stride_token + kv_head).to(tl.float32)
+            tl.store(scores_ptr + q_head * sc_stride_head + kv_token, dot * norm)
+
+
+@triton.jit
+def _tq_fused_qk_score_3bit_kernel(
+    q_rot_ptr,
+    packed_k_ptr,
+    norms_k_ptr,
+    scores_ptr,
+    centroids_ptr,
+    q_stride_head: tl.int64,
+    pk_stride_token: tl.int64,
+    pk_stride_head: tl.int64,
+    nk_stride_token: tl.int64,
+    sc_stride_head: tl.int64,
+    num_kv_tokens: tl.int32,
+    HEAD_DIM: tl.constexpr,
+    PACKED_DIM: tl.constexpr,       # HEAD_DIM * 3 // 8
+    Q_HEADS_PER_KV: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+):
+    """Fused Q·K^T score for 3-bit TQ cache — tiled over KV tokens.
+    Grid: (cdiv(num_kv_tokens, BLOCK_KV), num_q_heads)
+    """
+    block_id = tl.program_id(0)
+    q_head = tl.program_id(1)
+    kv_head = q_head // Q_HEADS_PER_KV
+    kv_start = block_id * BLOCK_KV
+
+    # Preload centroids
+    c0 = tl.load(centroids_ptr + 0).to(tl.float32)
+    c1 = tl.load(centroids_ptr + 1).to(tl.float32)
+    c2 = tl.load(centroids_ptr + 2).to(tl.float32)
+    c3 = tl.load(centroids_ptr + 3).to(tl.float32)
+    c4 = tl.load(centroids_ptr + 4).to(tl.float32)
+    c5 = tl.load(centroids_ptr + 5).to(tl.float32)
+    c6 = tl.load(centroids_ptr + 6).to(tl.float32)
+    c7 = tl.load(centroids_ptr + 7).to(tl.float32)
+
+    N_GROUPS: tl.constexpr = HEAD_DIM // 8
+
+    # Preload q_rot for this head
+    # We load per-group inside the token loop to keep register pressure low
+
+    for t in tl.static_range(BLOCK_KV):
+        kv_token = kv_start + t
+        if kv_token < num_kv_tokens:
+            pk_base = kv_token * pk_stride_token + kv_head * pk_stride_head
+            norm = tl.load(norms_k_ptr + kv_token * nk_stride_token + kv_head).to(tl.float32)
+
+            dot: tl.float32 = 0.0
+            for g in tl.static_range(N_GROUPS):
+                b0 = tl.load(packed_k_ptr + pk_base + g * 3).to(tl.int32)
+                b1 = tl.load(packed_k_ptr + pk_base + g * 3 + 1).to(tl.int32)
+                b2 = tl.load(packed_k_ptr + pk_base + g * 3 + 2).to(tl.int32)
+
+                i0 = b0 & 0x7
+                i1 = (b0 >> 3) & 0x7
+                i2 = ((b0 >> 6) & 0x3) | ((b1 & 0x1) << 2)
+                i3 = (b1 >> 1) & 0x7
+                i4 = (b1 >> 4) & 0x7
+                i5 = ((b1 >> 7) & 0x1) | ((b2 & 0x3) << 1)
+                i6 = (b2 >> 2) & 0x7
+                i7 = (b2 >> 5) & 0x7
+
+                v0 = tl.where(i0 == 0, c0, tl.where(i0 == 1, c1, tl.where(i0 == 2, c2, tl.where(i0 == 3, c3, tl.where(i0 == 4, c4, tl.where(i0 == 5, c5, tl.where(i0 == 6, c6, c7)))))))
+                v1 = tl.where(i1 == 0, c0, tl.where(i1 == 1, c1, tl.where(i1 == 2, c2, tl.where(i1 == 3, c3, tl.where(i1 == 4, c4, tl.where(i1 == 5, c5, tl.where(i1 == 6, c6, c7)))))))
+                v2 = tl.where(i2 == 0, c0, tl.where(i2 == 1, c1, tl.where(i2 == 2, c2, tl.where(i2 == 3, c3, tl.where(i2 == 4, c4, tl.where(i2 == 5, c5, tl.where(i2 == 6, c6, c7)))))))
+                v3 = tl.where(i3 == 0, c0, tl.where(i3 == 1, c1, tl.where(i3 == 2, c2, tl.where(i3 == 3, c3, tl.where(i3 == 4, c4, tl.where(i3 == 5, c5, tl.where(i3 == 6, c6, c7)))))))
+                v4 = tl.where(i4 == 0, c0, tl.where(i4 == 1, c1, tl.where(i4 == 2, c2, tl.where(i4 == 3, c3, tl.where(i4 == 4, c4, tl.where(i4 == 5, c5, tl.where(i4 == 6, c6, c7)))))))
+                v5 = tl.where(i5 == 0, c0, tl.where(i5 == 1, c1, tl.where(i5 == 2, c2, tl.where(i5 == 3, c3, tl.where(i5 == 4, c4, tl.where(i5 == 5, c5, tl.where(i5 == 6, c6, c7)))))))
+                v6 = tl.where(i6 == 0, c0, tl.where(i6 == 1, c1, tl.where(i6 == 2, c2, tl.where(i6 == 3, c3, tl.where(i6 == 4, c4, tl.where(i6 == 5, c5, tl.where(i6 == 6, c6, c7)))))))
+                v7 = tl.where(i7 == 0, c0, tl.where(i7 == 1, c1, tl.where(i7 == 2, c2, tl.where(i7 == 3, c3, tl.where(i7 == 4, c4, tl.where(i7 == 5, c5, tl.where(i7 == 6, c6, c7)))))))
+
+                q_base = q_head * q_stride_head + g * 8
+                q0 = tl.load(q_rot_ptr + q_base + 0).to(tl.float32)
+                q1 = tl.load(q_rot_ptr + q_base + 1).to(tl.float32)
+                q2 = tl.load(q_rot_ptr + q_base + 2).to(tl.float32)
+                q3 = tl.load(q_rot_ptr + q_base + 3).to(tl.float32)
+                q4 = tl.load(q_rot_ptr + q_base + 4).to(tl.float32)
+                q5 = tl.load(q_rot_ptr + q_base + 5).to(tl.float32)
+                q6 = tl.load(q_rot_ptr + q_base + 6).to(tl.float32)
+                q7 = tl.load(q_rot_ptr + q_base + 7).to(tl.float32)
+
+                dot += q0*v0 + q1*v1 + q2*v2 + q3*v3 + q4*v4 + q5*v5 + q6*v6 + q7*v7
+
+            tl.store(scores_ptr + q_head * sc_stride_head + kv_token, dot * norm)
+
+
+def turboquant_fused_qk_scores(
+    query: torch.Tensor,            # [num_q_heads, head_dim] FP16
+    packed_k: torch.Tensor,         # [num_kv_tokens, num_kv_heads, packed_dim] uint8
+    norms_k: torch.Tensor,          # [num_kv_tokens, num_kv_heads] FP16
+    bits: int = 3,
+    head_dim: int = 128,
+    scale: float = None,
+    had_fn=None,
+) -> torch.Tensor:
+    """Compute Q·K^T attention scores directly from TQ-packed K cache.
+
+    Rotates query with WHT once, then dots against centroid lookups.
+    Avoids K dequant (inverse WHT + FP16 materialization).
+
+    Args:
+        query: [num_q_heads, head_dim] — single decode token query
+        packed_k: [num_kv_tokens, num_kv_heads, packed_dim] — packed K cache
+        norms_k: [num_kv_tokens, num_kv_heads] — K norms
+        bits: 3, 4, or 35
+        head_dim: head dimension (128 or 256)
+        scale: attention scale (default: 1/sqrt(head_dim))
+
+    Returns:
+        scores: [num_q_heads, num_kv_tokens] FP32
+    """
+    num_q_heads = query.shape[0]
+    num_kv_tokens, num_kv_heads = norms_k.shape
+    device = query.device
+
+    if scale is None:
+        scale = head_dim ** -0.5
+
+    # Rotate query with WHT
+    q_rot = _apply_wht(query.unsqueeze(0), head_dim, had_fn).squeeze(0)
+    # Apply attention scale to rotated query
+    q_rot = (q_rot.float() * scale).half()
+
+    q_heads_per_kv = num_q_heads // num_kv_heads
+    scores = torch.empty(num_q_heads, num_kv_tokens, device=device, dtype=torch.float32)
+
+    BLOCK_KV = 16  # tokens per program — good balance for RDNA3/4
+    nw, ns = 2, 2
+
+    if bits == 4:
+        packed_dim = head_dim // 2
+        grid = (triton.cdiv(num_kv_tokens, BLOCK_KV), num_q_heads)
+        _tq_fused_qk_score_4bit_kernel[grid](
+            q_rot, packed_k, norms_k, scores,
+            get_centroids(4, head_dim, device, torch.float32),
+            q_rot.stride(0),
+            packed_k.stride(0), packed_k.stride(1),
+            norms_k.stride(0),
+            scores.stride(0),
+            num_kv_tokens,
+            HEAD_DIM=head_dim, PACKED_DIM=packed_dim,
+            Q_HEADS_PER_KV=q_heads_per_kv,
+            BLOCK_KV=BLOCK_KV,
+            num_warps=nw, num_stages=ns,
+        )
+    elif bits == 3:
+        packed_dim = head_dim * 3 // 8
+        grid = (triton.cdiv(num_kv_tokens, BLOCK_KV), num_q_heads)
+        _tq_fused_qk_score_3bit_kernel[grid](
+            q_rot, packed_k, norms_k, scores,
+            get_centroids(3, head_dim, device, torch.float32),
+            q_rot.stride(0),
+            packed_k.stride(0), packed_k.stride(1),
+            norms_k.stride(0),
+            scores.stride(0),
+            num_kv_tokens,
+            HEAD_DIM=head_dim, PACKED_DIM=packed_dim,
+            Q_HEADS_PER_KV=q_heads_per_kv,
+            BLOCK_KV=BLOCK_KV,
+            num_warps=nw, num_stages=ns,
+        )
+    elif bits == 35:
+        scores = _turboquant_fused_qk_scores_35(
+            q_rot, packed_k, norms_k, head_dim, q_heads_per_kv)
+    else:
+        raise ValueError(f"Unsupported bits: {bits}")
+
+    return scores
+
+
+def _turboquant_fused_qk_scores_35(
+    q_rot: torch.Tensor,            # [num_q_heads, head_dim] FP16 (already scaled)
+    packed_k: torch.Tensor,         # [num_kv_tokens, num_kv_heads, packed_dim] uint8
+    norms_k: torch.Tensor,          # [num_kv_tokens, num_kv_heads] FP16
+    head_dim: int,
+    q_heads_per_kv: int,
+) -> torch.Tensor:
+    """3.5-bit fused Q·K^T: first half 4-bit, second half 3-bit."""
+    num_q_heads = q_rot.shape[0]
+    num_kv_tokens, num_kv_heads = norms_k.shape
+    device = q_rot.device
+    half_dim = head_dim // 2
+
+    packed_4bit_dim = half_dim // 2  # 32
+    packed_3bit_dim = half_dim * 3 // 8  # 24
+
+    # Split packed K into 4-bit and 3-bit halves
+    packed_4bit = packed_k[..., :packed_4bit_dim].contiguous()
+    packed_3bit = packed_k[..., packed_4bit_dim:].contiguous()
+
+    # Split q_rot into halves matching WHT-rotated K
+    q_rot_hi = q_rot[:, :half_dim].contiguous()   # matches 4-bit half
+    q_rot_lo = q_rot[:, half_dim:].contiguous()    # matches 3-bit half
+
+    c4 = get_centroids(4, head_dim, device, torch.float32)
+    c3 = get_centroids(3, head_dim, device, torch.float32)
+
+    # Score = norm_k * (dot_hi + dot_lo)
+    # Use separate kernels for each half, accumulate
+    scores_hi = torch.empty(num_q_heads, num_kv_tokens, device=device, dtype=torch.float32)
+    scores_lo = torch.empty(num_q_heads, num_kv_tokens, device=device, dtype=torch.float32)
+
+    BLOCK_KV = 16
+    nw, ns = 2, 2
+    grid = (triton.cdiv(num_kv_tokens, BLOCK_KV), num_q_heads)
+
+    # 4-bit half: score_hi = norm * dot(q_hi, centroids[k_4bit])
+    _tq_fused_qk_score_4bit_kernel[grid](
+        q_rot_hi, packed_4bit,
+        norms_k,
+        scores_hi,
+        c4,
+        q_rot_hi.stride(0),
+        packed_4bit.stride(0), packed_4bit.stride(1),
+        norms_k.stride(0),
+        scores_hi.stride(0),
+        num_kv_tokens,
+        HEAD_DIM=half_dim, PACKED_DIM=packed_4bit_dim,
+        Q_HEADS_PER_KV=q_heads_per_kv,
+        BLOCK_KV=BLOCK_KV,
+        num_warps=nw, num_stages=ns,
+    )
+
+    # 3-bit half: score_lo = norm * dot(q_lo, centroids[k_3bit])
+    # Sum: score_hi + score_lo = norm * (dot_hi + dot_lo) = norm * dot(q_rot, full_centroid)
+    _tq_fused_qk_score_3bit_kernel[grid](
+        q_rot_lo, packed_3bit,
+        norms_k,
+        scores_lo,
+        c3,
+        q_rot_lo.stride(0),
+        packed_3bit.stride(0), packed_3bit.stride(1),
+        norms_k.stride(0),
+        scores_lo.stride(0),
+        num_kv_tokens,
+        HEAD_DIM=half_dim, PACKED_DIM=packed_3bit_dim,
+        Q_HEADS_PER_KV=q_heads_per_kv,
+        BLOCK_KV=BLOCK_KV,
+        num_warps=nw, num_stages=ns,
+    )
+
+    return scores_hi + scores_lo
+
+
+# ---------------------------------------------------------------------------
 # Unpacked fallback (Phase 1 compatibility, used if Triton unavailable)
 # ---------------------------------------------------------------------------
 

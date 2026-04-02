@@ -233,6 +233,19 @@ class RocmAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
+        if cache_dtype_str.startswith("tq"):
+            # TurboQuant: packed bytes layout
+            # Per head: packed_dim + 2 bytes (FP16 norm)
+            if cache_dtype_str == "tq35":
+                half = head_size // 2
+                packed_dim = half // 2 + half * 3 // 8
+            elif cache_dtype_str == "tq3":
+                packed_dim = head_size * 3 // 8
+            else:  # tq4
+                packed_dim = head_size * 4 // 8
+            bytes_per_head = packed_dim + 2
+            total_bytes = bytes_per_head * num_kv_heads
+            return (num_blocks, 2, block_size, total_bytes)
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -406,10 +419,10 @@ class RocmAttentionImpl(AttentionImpl):
 
         if self.is_tq_cache:
             # TurboQuant: decode cache to FP16, then run standard attention
-            key_cache_fp16, value_cache_fp16 = self._decode_tq_cache(
-                kv_cache, attn_metadata)
+            fp16_cache = self._decode_tq_cache(kv_cache, attn_metadata)
+            # fp16_cache: [2, num_blocks, block_size, num_kv_heads, head_size]
             key_cache, value_cache = PagedAttention.split_kv_cache(
-                key_cache_fp16, self.num_kv_heads, self.head_size
+                fp16_cache, self.num_kv_heads, self.head_size
             )
             kv_cache_dtype_for_attn = "auto"
         else:
@@ -489,32 +502,34 @@ class RocmAttentionImpl(AttentionImpl):
             2, num_blocks, block_size, self.num_kv_heads, self.head_size,
             device=kv_cache.device, dtype=torch.float16)
 
-        # Decode each KV (0=key, 1=value)
+        total_slots = num_blocks * block_size
+
+        # Decode each KV (0=key, 1=value) — vectorized over all slots
         for kv_idx in range(2):
-            for b in range(num_blocks):
-                for s in range(block_size):
-                    slot_data = kv_cache[b, kv_idx, s]  # [total_bytes]
-                    # Extract per-head packed + norms
-                    packed_list = []
-                    norms_list = []
-                    for h in range(self.num_kv_heads):
-                        start = h * bytes_per_head
-                        p = slot_data[start:start + packed_dim]
-                        n = slot_data[start + packed_dim:start + bytes_per_head]
-                        packed_list.append(p)
-                        norms_list.append(n)
+            # Reshape: [num_blocks, block_size, total_bytes] -> [N, total_bytes]
+            flat = kv_cache[:, kv_idx].reshape(total_slots, -1)
 
-                    packed = torch.stack(packed_list).unsqueeze(0)
-                    norms_bytes = torch.stack(norms_list)
-                    norms = norms_bytes.view(torch.float16).unsqueeze(0)
+            # Extract per-head packed and norms via reshape
+            # flat has layout: [h0_packed | h0_norm | h1_packed | h1_norm | ...]
+            # Reshape to [N, num_kv_heads, bytes_per_head]
+            per_head = flat[:, :self.num_kv_heads * bytes_per_head].reshape(
+                total_slots, self.num_kv_heads, bytes_per_head)
+            packed = per_head[:, :, :packed_dim]   # [N, heads, packed_dim]
+            norms_bytes = per_head[:, :, packed_dim:]  # [N, heads, 2]
+            norms = norms_bytes.contiguous().view(torch.float16).squeeze(-1)
+            # norms: [N, heads]
 
-                    if bits == 35:
-                        kv = turboquant_decode_35(packed, norms,
-                                                  head_dim=self.head_size)
-                    else:
-                        kv = turboquant_decode(packed, norms, bits=bits,
-                                               head_dim=self.head_size)
-                    fp16_cache[kv_idx, b, s] = kv[0]
+            # Batch decode all slots at once
+            if bits == 35:
+                decoded = turboquant_decode_35(
+                    packed, norms, head_dim=self.head_size)
+            else:
+                decoded = turboquant_decode(
+                    packed, norms, bits=bits, head_dim=self.head_size)
+            # decoded: [N, heads, head_size]
+
+            fp16_cache[kv_idx] = decoded.reshape(
+                num_blocks, block_size, self.num_kv_heads, self.head_size)
 
         return fp16_cache
 
@@ -583,7 +598,7 @@ class RocmAttentionImpl(AttentionImpl):
         """Encode K/V via TurboQuant and write packed data to cache.
 
         Cache layout per slot: [packed_indices (N bytes)] [norm (2 bytes)]
-        kv_cache shape: [num_blocks, 2, block_size, bytes_per_head]
+        kv_cache shape: [num_blocks, 2, block_size, total_bytes_all_heads]
         dim 1: 0=key, 1=value
         """
         from vllm.v1.attention.ops.turboquant_kv import (
@@ -592,38 +607,36 @@ class RocmAttentionImpl(AttentionImpl):
         )
 
         bits = self.tq_bits
-        num_tokens = key.shape[0]
+        block_size = kv_cache.shape[2]
+
+        # Filter valid slots
+        valid_mask = slot_mapping >= 0
+        valid_slots = slot_mapping[valid_mask]
+        block_indices = valid_slots // block_size
+        block_offsets = valid_slots % block_size
 
         for kv_idx, kv_tensor in enumerate([key, value]):
+            # Only encode valid tokens
+            kv_valid = kv_tensor[valid_mask]
+            if kv_valid.shape[0] == 0:
+                continue
+
             if bits == 35:
-                packed, norms = turboquant_encode_35(kv_tensor)
+                packed, norms = turboquant_encode_35(kv_valid)
             else:
-                packed, norms = turboquant_encode(kv_tensor, bits=bits)
+                packed, norms = turboquant_encode(kv_valid, bits=bits)
 
-            # packed: [num_tokens, num_kv_heads, packed_dim]
-            # norms: [num_tokens, num_kv_heads]
-            packed_dim = packed.shape[-1]
-
-            # Write packed indices + norm into cache slots
-            # norms as 2-byte FP16 appended after packed indices
+            # packed: [N, num_kv_heads, packed_dim]
+            # norms: [N, num_kv_heads]
             norms_bytes = norms.view(torch.uint8).reshape(
-                num_tokens, self.num_kv_heads, 2)
-            # Concat: [packed_dim bytes | 2 norm bytes]
+                kv_valid.shape[0], self.num_kv_heads, 2)
+            # Concat packed + norm bytes per head: [N, num_kv_heads, bph]
             slot_data = torch.cat([packed, norms_bytes], dim=-1)
+            # Flatten heads into single byte row: [N, num_kv_heads * bph]
+            slot_data_flat = slot_data.reshape(kv_valid.shape[0], -1)
 
-            # Scatter into cache pages via slot_mapping
-            for t in range(num_tokens):
-                slot = slot_mapping[t].item()
-                if slot < 0:
-                    continue
-                block_idx = slot // kv_cache.shape[2]
-                block_off = slot % kv_cache.shape[2]
-                bytes_per_head = slot_data.shape[-1]
-                for h in range(self.num_kv_heads):
-                    start = h * bytes_per_head
-                    end = start + bytes_per_head
-                    kv_cache[block_idx, kv_idx, block_off, start:end] = \
-                        slot_data[t, h]
+            # Vectorized scatter via advanced indexing
+            kv_cache[block_indices, kv_idx, block_offsets] = slot_data_flat
 
     def fused_rope_kvcache_supported(self):
         return rocm_aiter_ops.is_enabled()
