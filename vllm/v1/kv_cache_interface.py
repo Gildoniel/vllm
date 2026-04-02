@@ -61,12 +61,35 @@ class KVCacheSpec:
         return copy.deepcopy(specs[0])
 
 
+def _tq_page_size(block_size: int, num_kv_heads: int, head_size: int,
+                   kv_cache_dtype_str: str) -> int:
+    """Compute page size for TurboQuant KV cache (sub-byte packing).
+
+    Per token per KV head:
+      tq3:  head_size * 3 // 8 + 2 bytes (3-bit packed + FP16 norm)
+      tq35: head_size // 4 + head_size * 3 // 16 + 2 bytes (mixed 4/3-bit)
+      tq4:  head_size * 4 // 8 + 2 bytes (4-bit packed + FP16 norm)
+    Multiply by 2 for K+V, by block_size and num_kv_heads.
+    """
+    if kv_cache_dtype_str == "tq3":
+        bytes_per_head = head_size * 3 // 8 + 2
+    elif kv_cache_dtype_str == "tq35":
+        half = head_size // 2
+        bytes_per_head = half // 2 + half * 3 // 8 + 2
+    elif kv_cache_dtype_str == "tq4":
+        bytes_per_head = head_size * 4 // 8 + 2
+    else:
+        raise ValueError(f"Unknown TQ dtype: {kv_cache_dtype_str}")
+    return 2 * block_size * num_kv_heads * bytes_per_head
+
+
 @dataclass(frozen=True, kw_only=True)
 class AttentionSpec(KVCacheSpec):
     num_kv_heads: int
     head_size: int
     dtype: torch.dtype
     page_size_padded: int | None = None
+    kv_cache_dtype_str: str | None = None
 
     @property
     def page_size_bytes(self) -> int:
@@ -78,6 +101,9 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.kv_cache_dtype_str and self.kv_cache_dtype_str.startswith("tq"):
+            return _tq_page_size(self.block_size, self.num_kv_heads,
+                                 self.head_size, self.kv_cache_dtype_str)
         return (
             2
             * self.block_size

@@ -170,6 +170,9 @@ class RocmAttentionBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
+        "tq3",
+        "tq35",
+        "tq4",
     ]
 
     @staticmethod
@@ -281,6 +284,10 @@ class RocmAttentionImpl(AttentionImpl):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
         self.fp8_dtype = current_platform.fp8_dtype()
+        self.is_tq_cache = kv_cache_dtype.startswith("tq")
+        if self.is_tq_cache:
+            # TurboQuant bits: tq3→3, tq35→35, tq4→4
+            self.tq_bits = int(kv_cache_dtype[2:])
 
         self.sinks = sinks
         if sinks is not None:
@@ -397,16 +404,26 @@ class RocmAttentionImpl(AttentionImpl):
                 layer,
             )
 
-        key_cache, value_cache = PagedAttention.split_kv_cache(
-            kv_cache, self.num_kv_heads, self.head_size
-        )
-
-        if self.kv_cache_dtype.startswith("fp8"):
-            key_cache = key_cache.view(self.fp8_dtype)
-            value_cache = value_cache.view(self.fp8_dtype)
-            assert layer._q_scale_float == 1.0, (
-                "A non 1.0 q_scale is not currently supported."
+        if self.is_tq_cache:
+            # TurboQuant: decode cache to FP16, then run standard attention
+            key_cache_fp16, value_cache_fp16 = self._decode_tq_cache(
+                kv_cache, attn_metadata)
+            key_cache, value_cache = PagedAttention.split_kv_cache(
+                key_cache_fp16, self.num_kv_heads, self.head_size
             )
+            kv_cache_dtype_for_attn = "auto"
+        else:
+            key_cache, value_cache = PagedAttention.split_kv_cache(
+                kv_cache, self.num_kv_heads, self.head_size
+            )
+            kv_cache_dtype_for_attn = self.kv_cache_dtype
+
+            if self.kv_cache_dtype.startswith("fp8"):
+                key_cache = key_cache.view(self.fp8_dtype)
+                value_cache = value_cache.view(self.fp8_dtype)
+                assert layer._q_scale_float == 1.0, (
+                    "A non 1.0 q_scale is not currently supported."
+                )
 
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
@@ -420,7 +437,7 @@ class RocmAttentionImpl(AttentionImpl):
             key=key[:num_actual_tokens] if key is not None else None,
             value=value[:num_actual_tokens] if value is not None else None,
             output=output[:num_actual_tokens],
-            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_dtype=kv_cache_dtype_for_attn,
             key_cache=key_cache,
             value_cache=value_cache,
             block_table=block_table,
@@ -439,6 +456,68 @@ class RocmAttentionImpl(AttentionImpl):
 
         return output
 
+    def _decode_tq_cache(
+        self,
+        kv_cache: torch.Tensor,
+        attn_metadata,
+    ) -> torch.Tensor:
+        """Decode TurboQuant cache pages to FP16 for attention.
+
+        Returns a FP16 kv_cache tensor in standard vLLM layout:
+        [2, num_blocks, block_size, num_kv_heads, head_size]
+        """
+        from vllm.v1.attention.ops.turboquant_kv import (
+            turboquant_decode,
+            turboquant_decode_35,
+        )
+
+        bits = self.tq_bits
+        num_blocks = kv_cache.shape[0]
+        block_size = kv_cache.shape[2]
+
+        if bits == 35:
+            half = self.head_size // 2
+            packed_dim = half // 2 + half * 3 // 8
+        elif bits == 3:
+            packed_dim = self.head_size * 3 // 8
+        else:
+            packed_dim = self.head_size * 4 // 8
+        bytes_per_head = packed_dim + 2  # packed + FP16 norm
+
+        # Allocate FP16 output cache
+        fp16_cache = torch.empty(
+            2, num_blocks, block_size, self.num_kv_heads, self.head_size,
+            device=kv_cache.device, dtype=torch.float16)
+
+        # Decode each KV (0=key, 1=value)
+        for kv_idx in range(2):
+            for b in range(num_blocks):
+                for s in range(block_size):
+                    slot_data = kv_cache[b, kv_idx, s]  # [total_bytes]
+                    # Extract per-head packed + norms
+                    packed_list = []
+                    norms_list = []
+                    for h in range(self.num_kv_heads):
+                        start = h * bytes_per_head
+                        p = slot_data[start:start + packed_dim]
+                        n = slot_data[start + packed_dim:start + bytes_per_head]
+                        packed_list.append(p)
+                        norms_list.append(n)
+
+                    packed = torch.stack(packed_list).unsqueeze(0)
+                    norms_bytes = torch.stack(norms_list)
+                    norms = norms_bytes.view(torch.float16).unsqueeze(0)
+
+                    if bits == 35:
+                        kv = turboquant_decode_35(packed, norms,
+                                                  head_dim=self.head_size)
+                    else:
+                        kv = turboquant_decode(packed, norms, bits=bits,
+                                               head_dim=self.head_size)
+                    fp16_cache[kv_idx, b, s] = kv[0]
+
+        return fp16_cache
+
     def do_kv_cache_update(
         self,
         layer: AttentionLayer,
@@ -449,6 +528,13 @@ class RocmAttentionImpl(AttentionImpl):
     ):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             return
+
+        if self.is_tq_cache:
+            # TurboQuant path: encode K/V to packed format, write to cache
+            self._do_tq_kv_cache_update(layer, key, value, kv_cache,
+                                        slot_mapping)
+            return
+
         key_cache, value_cache = PagedAttention.split_kv_cache(
             kv_cache, self.num_kv_heads, self.head_size
         )
@@ -485,6 +571,59 @@ class RocmAttentionImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
+
+    def _do_tq_kv_cache_update(
+        self,
+        layer: AttentionLayer,
+        key: torch.Tensor,      # [num_tokens, num_kv_heads, head_size]
+        value: torch.Tensor,    # [num_tokens, num_kv_heads, head_size]
+        kv_cache: torch.Tensor, # [num_blocks, 2, block_size, bytes_per_head]
+        slot_mapping: torch.Tensor,  # [num_tokens]
+    ):
+        """Encode K/V via TurboQuant and write packed data to cache.
+
+        Cache layout per slot: [packed_indices (N bytes)] [norm (2 bytes)]
+        kv_cache shape: [num_blocks, 2, block_size, bytes_per_head]
+        dim 1: 0=key, 1=value
+        """
+        from vllm.v1.attention.ops.turboquant_kv import (
+            turboquant_encode,
+            turboquant_encode_35,
+        )
+
+        bits = self.tq_bits
+        num_tokens = key.shape[0]
+
+        for kv_idx, kv_tensor in enumerate([key, value]):
+            if bits == 35:
+                packed, norms = turboquant_encode_35(kv_tensor)
+            else:
+                packed, norms = turboquant_encode(kv_tensor, bits=bits)
+
+            # packed: [num_tokens, num_kv_heads, packed_dim]
+            # norms: [num_tokens, num_kv_heads]
+            packed_dim = packed.shape[-1]
+
+            # Write packed indices + norm into cache slots
+            # norms as 2-byte FP16 appended after packed indices
+            norms_bytes = norms.view(torch.uint8).reshape(
+                num_tokens, self.num_kv_heads, 2)
+            # Concat: [packed_dim bytes | 2 norm bytes]
+            slot_data = torch.cat([packed, norms_bytes], dim=-1)
+
+            # Scatter into cache pages via slot_mapping
+            for t in range(num_tokens):
+                slot = slot_mapping[t].item()
+                if slot < 0:
+                    continue
+                block_idx = slot // kv_cache.shape[2]
+                block_off = slot % kv_cache.shape[2]
+                bytes_per_head = slot_data.shape[-1]
+                for h in range(self.num_kv_heads):
+                    start = h * bytes_per_head
+                    end = start + bytes_per_head
+                    kv_cache[block_idx, kv_idx, block_off, start:end] = \
+                        slot_data[t, h]
 
     def fused_rope_kvcache_supported(self):
         return rocm_aiter_ops.is_enabled()
