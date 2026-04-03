@@ -895,6 +895,693 @@ def _turboquant_fused_qk_scores_35(
 
 
 # ---------------------------------------------------------------------------
+# Phase 5: Fused TQ-Attention Decode kernel
+# ---------------------------------------------------------------------------
+# Single Triton program per Q head. Reads compressed KV directly from HBM,
+# computes Q·K^T scores via centroid lookups in WHT space, runs online
+# softmax, accumulates V in WHT space, outputs one vector.
+#
+# HBM traffic: only compressed TQ data (4.4x less than FP8).
+# No FP16 cache materialization. One inverse WHT at the end.
+
+@triton.jit
+def _tq_fused_attn_decode_35_kernel(
+    # q_rot: [num_q_heads, head_dim] FP16 — pre-rotated and scaled
+    q_rot_ptr,
+    # packed_k: [num_kv_tokens, num_kv_heads, packed_dim_35] uint8
+    packed_k_ptr,
+    # norms_k: [num_kv_tokens, num_kv_heads] FP16
+    norms_k_ptr,
+    # packed_v: same layout as K
+    packed_v_ptr,
+    # norms_v: same layout as K
+    norms_v_ptr,
+    # output_rot: [num_q_heads, head_dim] FP32 — output in WHT space
+    output_rot_ptr,
+    # centroids
+    centroids_4bit_ptr,   # (16,) FP32
+    centroids_3bit_ptr,   # (8,) FP32
+    # Strides
+    q_stride_head: tl.int64,
+    pk_stride_token: tl.int64,
+    pk_stride_head: tl.int64,
+    nk_stride_token: tl.int64,
+    out_stride_head: tl.int64,
+    # Sizes
+    num_kv_tokens: tl.int32,
+    # Constants
+    HALF_DIM: tl.constexpr,          # 64 for head_dim=128
+    PACKED_4BIT_DIM: tl.constexpr,   # 32
+    PACKED_3BIT_DIM: tl.constexpr,   # 24
+    Q_HEADS_PER_KV: tl.constexpr,
+):
+    """Fused TQ3.5 decode attention — one program per Q head.
+
+    Grid: (num_q_heads,)
+    """
+    q_head = tl.program_id(0)
+    kv_head = q_head // Q_HEADS_PER_KV
+
+    # ---- Load query (WHT-rotated, pre-scaled) ----
+    q_base = q_head * q_stride_head
+    # 4-bit half (first HALF_DIM dims): even/odd pairs
+    q_hi_even = tl.load(q_rot_ptr + q_base + tl.arange(0, PACKED_4BIT_DIM) * 2).to(tl.float32)
+    q_hi_odd = tl.load(q_rot_ptr + q_base + tl.arange(0, PACKED_4BIT_DIM) * 2 + 1).to(tl.float32)
+    # 3-bit half (last HALF_DIM dims)
+    q_lo = tl.load(q_rot_ptr + q_base + HALF_DIM + tl.arange(0, HALF_DIM)).to(tl.float32)
+
+    # ---- Precompute 3-bit group/pos indices for vectorized unpack ----
+    group_idx = tl.arange(0, HALF_DIM) // 8
+    pos = tl.arange(0, HALF_DIM) % 8
+
+    # ---- Online softmax accumulators ----
+    m: tl.float32 = -1e30
+    l: tl.float32 = 0.0
+
+    # ---- Output accumulators (WHT space) ----
+    o_hi_even = tl.zeros((PACKED_4BIT_DIM,), dtype=tl.float32)
+    o_hi_odd = tl.zeros((PACKED_4BIT_DIM,), dtype=tl.float32)
+    o_lo = tl.zeros((HALF_DIM,), dtype=tl.float32)
+
+    # ---- Main loop over KV tokens ----
+    for t in range(num_kv_tokens):
+        pk_base = t * pk_stride_token + kv_head * pk_stride_head
+
+        # ==== K: compute attention score ====
+
+        # 4-bit half: load 32 packed bytes → 64 indices → centroid dot
+        pk_4bit = tl.load(packed_k_ptr + pk_base + tl.arange(0, PACKED_4BIT_DIM)).to(tl.int32)
+        k_even_idx = pk_4bit & 0xF
+        k_odd_idx = (pk_4bit >> 4) & 0xF
+
+        k_even_val = tl.zeros((PACKED_4BIT_DIM,), dtype=tl.float32)
+        k_odd_val = tl.zeros((PACKED_4BIT_DIM,), dtype=tl.float32)
+        for c in tl.static_range(16):
+            c_val = tl.load(centroids_4bit_ptr + c).to(tl.float32)
+            k_even_val = tl.where(k_even_idx == c, c_val, k_even_val)
+            k_odd_val = tl.where(k_odd_idx == c, c_val, k_odd_val)
+
+        score_hi = tl.sum(q_hi_even * k_even_val) + tl.sum(q_hi_odd * k_odd_val)
+
+        # 3-bit half: vectorized unpack 24 bytes → 64 indices → centroid dot
+        b0 = tl.load(packed_k_ptr + pk_base + PACKED_4BIT_DIM + group_idx * 3).to(tl.int32)
+        b1 = tl.load(packed_k_ptr + pk_base + PACKED_4BIT_DIM + group_idx * 3 + 1).to(tl.int32)
+        b2 = tl.load(packed_k_ptr + pk_base + PACKED_4BIT_DIM + group_idx * 3 + 2).to(tl.int32)
+
+        k_lo_idx = tl.where(pos == 0, b0 & 0x7,
+                   tl.where(pos == 1, (b0 >> 3) & 0x7,
+                   tl.where(pos == 2, ((b0 >> 6) & 0x3) | ((b1 & 0x1) << 2),
+                   tl.where(pos == 3, (b1 >> 1) & 0x7,
+                   tl.where(pos == 4, (b1 >> 4) & 0x7,
+                   tl.where(pos == 5, ((b1 >> 7) & 0x1) | ((b2 & 0x3) << 1),
+                   tl.where(pos == 6, (b2 >> 2) & 0x7,
+                                      (b2 >> 5) & 0x7)))))))
+
+        k_lo_val = tl.zeros((HALF_DIM,), dtype=tl.float32)
+        for c in tl.static_range(8):
+            c_val = tl.load(centroids_3bit_ptr + c).to(tl.float32)
+            k_lo_val = tl.where(k_lo_idx == c, c_val, k_lo_val)
+
+        score_lo = tl.sum(q_lo * k_lo_val)
+
+        nk = tl.load(norms_k_ptr + t * nk_stride_token + kv_head).to(tl.float32)
+        score = nk * (score_hi + score_lo)
+
+        # ==== Online softmax ====
+        m_new = tl.maximum(m, score)
+        alpha = tl.exp(m - m_new)
+        p = tl.exp(score - m_new)
+        l = alpha * l + p
+        o_hi_even = alpha * o_hi_even
+        o_hi_odd = alpha * o_hi_odd
+        o_lo = alpha * o_lo
+        m = m_new
+
+        # ==== V: accumulate in WHT space ====
+        pv_base = t * pk_stride_token + kv_head * pk_stride_head
+        nv = tl.load(norms_v_ptr + t * nk_stride_token + kv_head).to(tl.float32)
+        wp = p * nv
+
+        # 4-bit half V
+        pv_4bit = tl.load(packed_v_ptr + pv_base + tl.arange(0, PACKED_4BIT_DIM)).to(tl.int32)
+        v_even_idx = pv_4bit & 0xF
+        v_odd_idx = (pv_4bit >> 4) & 0xF
+
+        v_even_val = tl.zeros((PACKED_4BIT_DIM,), dtype=tl.float32)
+        v_odd_val = tl.zeros((PACKED_4BIT_DIM,), dtype=tl.float32)
+        for c in tl.static_range(16):
+            c_val = tl.load(centroids_4bit_ptr + c).to(tl.float32)
+            v_even_val = tl.where(v_even_idx == c, c_val, v_even_val)
+            v_odd_val = tl.where(v_odd_idx == c, c_val, v_odd_val)
+
+        o_hi_even += wp * v_even_val
+        o_hi_odd += wp * v_odd_val
+
+        # 3-bit half V — vectorized unpack
+        vb0 = tl.load(packed_v_ptr + pv_base + PACKED_4BIT_DIM + group_idx * 3).to(tl.int32)
+        vb1 = tl.load(packed_v_ptr + pv_base + PACKED_4BIT_DIM + group_idx * 3 + 1).to(tl.int32)
+        vb2 = tl.load(packed_v_ptr + pv_base + PACKED_4BIT_DIM + group_idx * 3 + 2).to(tl.int32)
+
+        v_lo_idx = tl.where(pos == 0, vb0 & 0x7,
+                   tl.where(pos == 1, (vb0 >> 3) & 0x7,
+                   tl.where(pos == 2, ((vb0 >> 6) & 0x3) | ((vb1 & 0x1) << 2),
+                   tl.where(pos == 3, (vb1 >> 1) & 0x7,
+                   tl.where(pos == 4, (vb1 >> 4) & 0x7,
+                   tl.where(pos == 5, ((vb1 >> 7) & 0x1) | ((vb2 & 0x3) << 1),
+                   tl.where(pos == 6, (vb2 >> 2) & 0x7,
+                                      (vb2 >> 5) & 0x7)))))))
+
+        v_lo_val = tl.zeros((HALF_DIM,), dtype=tl.float32)
+        for c in tl.static_range(8):
+            c_val = tl.load(centroids_3bit_ptr + c).to(tl.float32)
+            v_lo_val = tl.where(v_lo_idx == c, c_val, v_lo_val)
+
+        o_lo += wp * v_lo_val
+
+    # ---- Store output (WHT space, normalized) ----
+    inv_l = 1.0 / l
+    out_base = q_head * out_stride_head
+    tl.store(output_rot_ptr + out_base + tl.arange(0, PACKED_4BIT_DIM) * 2,
+             o_hi_even * inv_l)
+    tl.store(output_rot_ptr + out_base + tl.arange(0, PACKED_4BIT_DIM) * 2 + 1,
+             o_hi_odd * inv_l)
+    tl.store(output_rot_ptr + out_base + HALF_DIM + tl.arange(0, HALF_DIM),
+             o_lo * inv_l)
+
+
+# ---------------------------------------------------------------------------
+# V2: Gather-based centroid + BLOCK_KV tiling — eliminates tl.where cascades
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _tq_fused_attn_decode_35_v2_kernel(
+    # q_rot: [num_q_heads, head_dim] FP16 — pre-rotated and scaled
+    q_rot_ptr,
+    # packed_k: [num_kv_tokens, num_kv_heads, packed_dim_35] uint8
+    packed_k_ptr,
+    # norms_k: [num_kv_tokens, num_kv_heads] FP16
+    norms_k_ptr,
+    # packed_v: same layout as K
+    packed_v_ptr,
+    # norms_v: same layout as K
+    norms_v_ptr,
+    # output_rot: [num_q_heads, head_dim] FP32 — output in WHT space
+    output_rot_ptr,
+    # centroids
+    centroids_4bit_ptr,   # (16,) FP32
+    centroids_3bit_ptr,   # (8,) FP32
+    # Strides
+    q_stride_head: tl.int64,
+    pk_stride_token: tl.int64,
+    pk_stride_head: tl.int64,
+    nk_stride_token: tl.int64,
+    out_stride_head: tl.int64,
+    # Sizes
+    num_kv_tokens: tl.int32,
+    # Constants
+    HALF_DIM: tl.constexpr,          # 64 for head_dim=128
+    PACKED_4BIT_DIM: tl.constexpr,   # 32
+    PACKED_3BIT_DIM: tl.constexpr,   # 24
+    Q_HEADS_PER_KV: tl.constexpr,
+    BLOCK_KV: tl.constexpr,          # KV tokens per iteration (16 or 32)
+):
+    """Fused TQ3.5 decode attention V2 — gather centroids + KV tiling.
+
+    Key optimizations over V1:
+    1. Gather-based centroid lookup: tl.load(centroids + idx) replaces 16× tl.where
+    2. BLOCK_KV tiling: process multiple KV tokens per iteration
+    3. Block-wise online softmax with vectorized score computation
+
+    Grid: (num_q_heads,)
+    """
+    q_head = tl.program_id(0)
+    kv_head = q_head // Q_HEADS_PER_KV
+
+    # ---- Load query (WHT-rotated, pre-scaled) ----
+    q_base = q_head * q_stride_head
+    q_hi_even = tl.load(q_rot_ptr + q_base + tl.arange(0, PACKED_4BIT_DIM) * 2).to(tl.float32)
+    q_hi_odd = tl.load(q_rot_ptr + q_base + tl.arange(0, PACKED_4BIT_DIM) * 2 + 1).to(tl.float32)
+    q_lo = tl.load(q_rot_ptr + q_base + HALF_DIM + tl.arange(0, HALF_DIM)).to(tl.float32)
+
+    # ---- 3-bit group/pos indices (for vectorized unpack) ----
+    group_idx = tl.arange(0, HALF_DIM) // 8  # [HALF_DIM,]
+    pos = tl.arange(0, HALF_DIM) % 8
+
+    # ---- Online softmax accumulators ----
+    m: tl.float32 = -1e30
+    l: tl.float32 = 0.0
+    o_hi_even = tl.zeros((PACKED_4BIT_DIM,), dtype=tl.float32)
+    o_hi_odd = tl.zeros((PACKED_4BIT_DIM,), dtype=tl.float32)
+    o_lo = tl.zeros((HALF_DIM,), dtype=tl.float32)
+
+    # ---- Token offset base for this KV head ----
+    kv_head_byte_off = kv_head * pk_stride_head
+
+    # ---- Main loop: tile over KV tokens in blocks of BLOCK_KV ----
+    for t_start in range(0, num_kv_tokens, BLOCK_KV):
+        t_offs = t_start + tl.arange(0, BLOCK_KV)  # [BKV,]
+        t_mask = t_offs < num_kv_tokens
+
+        # ==== K: load packed bytes [BKV, PACKED_4BIT_DIM] ====
+        pk_base = t_offs[:, None] * pk_stride_token + kv_head_byte_off
+        pk_4bit_ptrs = packed_k_ptr + pk_base + tl.arange(0, PACKED_4BIT_DIM)[None, :]
+        pk_4bit = tl.load(pk_4bit_ptrs, mask=t_mask[:, None], other=0).to(tl.int32)
+
+        # Unpack 4-bit indices [BKV, PACKED_4BIT_DIM]
+        k_even_idx = pk_4bit & 0xF
+        k_odd_idx = (pk_4bit >> 4) & 0xF
+
+        # GATHER centroid lookup — replaces 16× tl.where loop!
+        k_even_val = tl.load(centroids_4bit_ptr + k_even_idx)  # [BKV, P4D]
+        k_odd_val = tl.load(centroids_4bit_ptr + k_odd_idx)
+
+        # Dot products: q [P4D,] × k [BKV, P4D] → scores [BKV,]
+        score_hi = (tl.sum(q_hi_even[None, :] * k_even_val, axis=1) +
+                    tl.sum(q_hi_odd[None, :] * k_odd_val, axis=1))
+
+        # ==== K: 3-bit half [BKV, HALF_DIM] ====
+        b0_ptrs = packed_k_ptr + pk_base + PACKED_4BIT_DIM + group_idx[None, :] * 3
+        b1_ptrs = b0_ptrs + 1
+        b2_ptrs = b0_ptrs + 2
+        b0 = tl.load(b0_ptrs, mask=t_mask[:, None], other=0).to(tl.int32)
+        b1 = tl.load(b1_ptrs, mask=t_mask[:, None], other=0).to(tl.int32)
+        b2 = tl.load(b2_ptrs, mask=t_mask[:, None], other=0).to(tl.int32)
+
+        # Vectorized 3-bit unpack [BKV, HALF_DIM]
+        k_lo_idx = tl.where(pos[None, :] == 0, b0 & 0x7,
+                   tl.where(pos[None, :] == 1, (b0 >> 3) & 0x7,
+                   tl.where(pos[None, :] == 2, ((b0 >> 6) & 0x3) | ((b1 & 0x1) << 2),
+                   tl.where(pos[None, :] == 3, (b1 >> 1) & 0x7,
+                   tl.where(pos[None, :] == 4, (b1 >> 4) & 0x7,
+                   tl.where(pos[None, :] == 5, ((b1 >> 7) & 0x1) | ((b2 & 0x3) << 1),
+                   tl.where(pos[None, :] == 6, (b2 >> 2) & 0x7,
+                                                (b2 >> 5) & 0x7)))))))
+
+        # GATHER centroid lookup
+        k_lo_val = tl.load(centroids_3bit_ptr + k_lo_idx)  # [BKV, HALF_DIM]
+        score_lo = tl.sum(q_lo[None, :] * k_lo_val, axis=1)  # [BKV,]
+
+        # K norms [BKV,]
+        nk = tl.load(norms_k_ptr + t_offs * nk_stride_token + kv_head,
+                     mask=t_mask, other=0.0).to(tl.float32)
+        scores = nk * (score_hi + score_lo)
+
+        # ==== Block-wise online softmax ====
+        # Mask out invalid tokens before computing max
+        scores_masked = scores + tl.where(t_mask, 0.0, -1e30)
+        block_max = tl.max(scores_masked)
+        m_new = tl.maximum(m, block_max)
+        alpha = tl.exp(m - m_new)
+        p = tl.exp(scores - m_new) * t_mask.to(tl.float32)
+        l = alpha * l + tl.sum(p)
+
+        # Rescale running accumulators
+        o_hi_even = alpha * o_hi_even
+        o_hi_odd = alpha * o_hi_odd
+        o_lo = alpha * o_lo
+        m = m_new
+
+        # ==== V: load + gather + weighted accumulate ====
+        nv = tl.load(norms_v_ptr + t_offs * nk_stride_token + kv_head,
+                     mask=t_mask, other=0.0).to(tl.float32)
+        wp = p * nv  # [BKV,]
+
+        # V 4-bit half [BKV, PACKED_4BIT_DIM]
+        pv_base = t_offs[:, None] * pk_stride_token + kv_head_byte_off
+        pv_4bit = tl.load(packed_v_ptr + pv_base + tl.arange(0, PACKED_4BIT_DIM)[None, :],
+                          mask=t_mask[:, None], other=0).to(tl.int32)
+        v_even_idx = pv_4bit & 0xF
+        v_odd_idx = (pv_4bit >> 4) & 0xF
+        v_even_val = tl.load(centroids_4bit_ptr + v_even_idx)
+        v_odd_val = tl.load(centroids_4bit_ptr + v_odd_idx)
+
+        # Weighted sum: [BKV, P4D] weighted by wp [BKV,] → [P4D,]
+        o_hi_even += tl.sum(wp[:, None] * v_even_val, axis=0)
+        o_hi_odd += tl.sum(wp[:, None] * v_odd_val, axis=0)
+
+        # V 3-bit half [BKV, HALF_DIM]
+        vb0 = tl.load(packed_v_ptr + pv_base + PACKED_4BIT_DIM + group_idx[None, :] * 3,
+                       mask=t_mask[:, None], other=0).to(tl.int32)
+        vb1 = tl.load(packed_v_ptr + pv_base + PACKED_4BIT_DIM + group_idx[None, :] * 3 + 1,
+                       mask=t_mask[:, None], other=0).to(tl.int32)
+        vb2 = tl.load(packed_v_ptr + pv_base + PACKED_4BIT_DIM + group_idx[None, :] * 3 + 2,
+                       mask=t_mask[:, None], other=0).to(tl.int32)
+
+        v_lo_idx = tl.where(pos[None, :] == 0, vb0 & 0x7,
+                   tl.where(pos[None, :] == 1, (vb0 >> 3) & 0x7,
+                   tl.where(pos[None, :] == 2, ((vb0 >> 6) & 0x3) | ((vb1 & 0x1) << 2),
+                   tl.where(pos[None, :] == 3, (vb1 >> 1) & 0x7,
+                   tl.where(pos[None, :] == 4, (vb1 >> 4) & 0x7,
+                   tl.where(pos[None, :] == 5, ((vb1 >> 7) & 0x1) | ((vb2 & 0x3) << 1),
+                   tl.where(pos[None, :] == 6, (vb2 >> 2) & 0x7,
+                                                (vb2 >> 5) & 0x7)))))))
+
+        v_lo_val = tl.load(centroids_3bit_ptr + v_lo_idx)
+        o_lo += tl.sum(wp[:, None] * v_lo_val, axis=0)
+
+    # ---- Store output (WHT space, normalized) ----
+    inv_l = 1.0 / l
+    out_base = q_head * out_stride_head
+    tl.store(output_rot_ptr + out_base + tl.arange(0, PACKED_4BIT_DIM) * 2,
+             o_hi_even * inv_l)
+    tl.store(output_rot_ptr + out_base + tl.arange(0, PACKED_4BIT_DIM) * 2 + 1,
+             o_hi_odd * inv_l)
+    tl.store(output_rot_ptr + out_base + HALF_DIM + tl.arange(0, HALF_DIM),
+             o_lo * inv_l)
+
+
+# ---------------------------------------------------------------------------
+# V3: Paged fused attention — CUDA-graph safe (no Python loop / .item())
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _tq_paged_fused_attn_35_kernel(
+    # q_rot: [num_seqs, num_q_heads, head_dim] FP16, pre-rotated+scaled
+    q_rot_ptr,
+    # kv_cache: [num_blocks_total, 2, block_size, slot_bytes] uint8
+    kv_cache_ptr,
+    # block_table: [num_seqs, max_num_blocks_per_seq] int32
+    block_table_ptr,
+    # seq_lens: [num_seqs] int32
+    seq_lens_ptr,
+    # output_rot: [num_seqs, num_q_heads, head_dim] FP32
+    output_rot_ptr,
+    # centroids
+    centroids_4bit_ptr,
+    centroids_3bit_ptr,
+    # Strides
+    q_stride_seq: tl.int64,
+    q_stride_head: tl.int64,
+    cache_stride_block: tl.int64,   # kv_cache.stride(0)
+    cache_stride_kv: tl.int64,      # kv_cache.stride(1)
+    cache_stride_token: tl.int64,   # kv_cache.stride(2)
+    bt_stride_seq: tl.int64,        # block_table.stride(0)
+    out_stride_seq: tl.int64,
+    out_stride_head: tl.int64,
+    # Constants
+    BLOCK_SIZE: tl.constexpr,
+    HALF_DIM: tl.constexpr,
+    PACKED_4BIT_DIM: tl.constexpr,
+    PACKED_3BIT_DIM: tl.constexpr,
+    TQ_BYTES_PER_HEAD: tl.constexpr,  # packed_dim + 2
+    NUM_KV_HEADS: tl.constexpr,
+    Q_HEADS_PER_KV: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+):
+    """Paged fused TQ3.5 decode attention — CUDA-graph compatible.
+
+    Grid: (num_q_heads, num_seqs)
+    Each program handles one Q head for one sequence, reading pages
+    from the block table.
+    """
+    q_head = tl.program_id(0)
+    seq_id = tl.program_id(1)
+    kv_head = q_head // Q_HEADS_PER_KV
+
+    seq_len = tl.load(seq_lens_ptr + seq_id)
+
+    # ---- Load query ----
+    q_base = seq_id * q_stride_seq + q_head * q_stride_head
+    q_hi_even = tl.load(q_rot_ptr + q_base + tl.arange(0, PACKED_4BIT_DIM) * 2).to(tl.float32)
+    q_hi_odd = tl.load(q_rot_ptr + q_base + tl.arange(0, PACKED_4BIT_DIM) * 2 + 1).to(tl.float32)
+    q_lo = tl.load(q_rot_ptr + q_base + HALF_DIM + tl.arange(0, HALF_DIM)).to(tl.float32)
+
+    # 3-bit unpack indices
+    group_idx = tl.arange(0, HALF_DIM) // 8
+    pos = tl.arange(0, HALF_DIM) % 8
+
+    # Online softmax accumulators
+    m: tl.float32 = -1e30
+    l: tl.float32 = 0.0
+    o_hi_even = tl.zeros((PACKED_4BIT_DIM,), dtype=tl.float32)
+    o_hi_odd = tl.zeros((PACKED_4BIT_DIM,), dtype=tl.float32)
+    o_lo = tl.zeros((HALF_DIM,), dtype=tl.float32)
+
+    # Byte offset within a slot for this KV head
+    head_byte_off = kv_head * TQ_BYTES_PER_HEAD
+    # Packed dim offset for 3-bit half
+    off_3bit = PACKED_4BIT_DIM
+
+    # Number of blocks needed for this sequence
+    num_blocks_seq = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+    # ---- Main loop: iterate over cache blocks ----
+    for block_idx in range(0, num_blocks_seq):
+        # Look up physical block ID from block table
+        phys_block = tl.load(block_table_ptr + seq_id * bt_stride_seq + block_idx)
+
+        # Tokens in this block
+        block_start = block_idx * BLOCK_SIZE
+        block_end = tl.minimum(block_start + BLOCK_SIZE, seq_len)
+        num_tokens_in_block = block_end - block_start
+
+        # Process BLOCK_KV tokens at a time within this cache block
+        for t_off in tl.static_range(0, BLOCK_SIZE, BLOCK_KV):
+            t_local = tl.arange(0, BLOCK_KV) + t_off
+            t_mask = t_local < num_tokens_in_block
+
+            # Base pointer for K in this cache block
+            # kv_cache[phys_block, 0, t_local, head_byte_off + ...]
+            k_slot_base = (phys_block * cache_stride_block +
+                           0 * cache_stride_kv +
+                           t_local[:, None] * cache_stride_token +
+                           head_byte_off)
+
+            # ==== K: 4-bit half ====
+            pk_4bit = tl.load(kv_cache_ptr + k_slot_base +
+                              tl.arange(0, PACKED_4BIT_DIM)[None, :],
+                              mask=t_mask[:, None], other=0).to(tl.int32)
+            k_even_idx = pk_4bit & 0xF
+            k_odd_idx = (pk_4bit >> 4) & 0xF
+            k_even_val = tl.load(centroids_4bit_ptr + k_even_idx)
+            k_odd_val = tl.load(centroids_4bit_ptr + k_odd_idx)
+            score_hi = (tl.sum(q_hi_even[None, :] * k_even_val, axis=1) +
+                        tl.sum(q_hi_odd[None, :] * k_odd_val, axis=1))
+
+            # ==== K: 3-bit half ====
+            k_3bit_base = k_slot_base + off_3bit
+            b0 = tl.load(kv_cache_ptr + k_3bit_base + group_idx[None, :] * 3,
+                          mask=t_mask[:, None], other=0).to(tl.int32)
+            b1 = tl.load(kv_cache_ptr + k_3bit_base + group_idx[None, :] * 3 + 1,
+                          mask=t_mask[:, None], other=0).to(tl.int32)
+            b2 = tl.load(kv_cache_ptr + k_3bit_base + group_idx[None, :] * 3 + 2,
+                          mask=t_mask[:, None], other=0).to(tl.int32)
+
+            k_lo_idx = tl.where(pos[None, :] == 0, b0 & 0x7,
+                       tl.where(pos[None, :] == 1, (b0 >> 3) & 0x7,
+                       tl.where(pos[None, :] == 2, ((b0 >> 6) & 0x3) | ((b1 & 0x1) << 2),
+                       tl.where(pos[None, :] == 3, (b1 >> 1) & 0x7,
+                       tl.where(pos[None, :] == 4, (b1 >> 4) & 0x7,
+                       tl.where(pos[None, :] == 5, ((b1 >> 7) & 0x1) | ((b2 & 0x3) << 1),
+                       tl.where(pos[None, :] == 6, (b2 >> 2) & 0x7,
+                                                    (b2 >> 5) & 0x7)))))))
+            k_lo_val = tl.load(centroids_3bit_ptr + k_lo_idx)
+            score_lo = tl.sum(q_lo[None, :] * k_lo_val, axis=1)
+
+            # K norms: stored as FP16 (2 bytes) after packed data
+            packed_dim = PACKED_4BIT_DIM + PACKED_3BIT_DIM
+            # Cast cache pointer to float16 to load norms directly
+            # Norm is at byte offset (head_byte_off + packed_dim) which is always even
+            norm_fp16_ptr = (kv_cache_ptr + phys_block * cache_stride_block +
+                             0 * cache_stride_kv +
+                             head_byte_off + packed_dim).to(tl.pointer_type(tl.float16))
+            # Stride in float16 elements = cache_stride_token // 2
+            nk = tl.load(norm_fp16_ptr +
+                         (t_off + tl.arange(0, BLOCK_KV)) * (cache_stride_token // 2),
+                         mask=t_mask, other=0.0).to(tl.float32)
+
+            scores = nk * (score_hi + score_lo)
+
+            # ==== Block online softmax ====
+            scores_masked = scores + tl.where(t_mask, 0.0, -1e30)
+            block_max = tl.max(scores_masked)
+            m_new = tl.maximum(m, block_max)
+            alpha = tl.exp(m - m_new)
+            p = tl.exp(scores - m_new) * t_mask.to(tl.float32)
+            l = alpha * l + tl.sum(p)
+            o_hi_even = alpha * o_hi_even
+            o_hi_odd = alpha * o_hi_odd
+            o_lo = alpha * o_lo
+            m = m_new
+
+            # ==== V: load + gather + accumulate ====
+            v_slot_base = (phys_block * cache_stride_block +
+                           1 * cache_stride_kv +
+                           t_local[:, None] * cache_stride_token +
+                           head_byte_off)
+
+            # V norms — same approach as K norms
+            vnorm_fp16_ptr = (kv_cache_ptr + phys_block * cache_stride_block +
+                              1 * cache_stride_kv +
+                              head_byte_off + packed_dim).to(tl.pointer_type(tl.float16))
+            nv = tl.load(vnorm_fp16_ptr +
+                         (t_off + tl.arange(0, BLOCK_KV)) * (cache_stride_token // 2),
+                         mask=t_mask, other=0.0).to(tl.float32)
+            wp = p * nv
+
+            # V 4-bit half
+            pv_4bit = tl.load(kv_cache_ptr + v_slot_base +
+                              tl.arange(0, PACKED_4BIT_DIM)[None, :],
+                              mask=t_mask[:, None], other=0).to(tl.int32)
+            v_even_val = tl.load(centroids_4bit_ptr + (pv_4bit & 0xF))
+            v_odd_val = tl.load(centroids_4bit_ptr + ((pv_4bit >> 4) & 0xF))
+            o_hi_even += tl.sum(wp[:, None] * v_even_val, axis=0)
+            o_hi_odd += tl.sum(wp[:, None] * v_odd_val, axis=0)
+
+            # V 3-bit half
+            v_3bit_base = v_slot_base + off_3bit
+            vb0 = tl.load(kv_cache_ptr + v_3bit_base + group_idx[None, :] * 3,
+                           mask=t_mask[:, None], other=0).to(tl.int32)
+            vb1 = tl.load(kv_cache_ptr + v_3bit_base + group_idx[None, :] * 3 + 1,
+                           mask=t_mask[:, None], other=0).to(tl.int32)
+            vb2 = tl.load(kv_cache_ptr + v_3bit_base + group_idx[None, :] * 3 + 2,
+                           mask=t_mask[:, None], other=0).to(tl.int32)
+            v_lo_idx = tl.where(pos[None, :] == 0, vb0 & 0x7,
+                       tl.where(pos[None, :] == 1, (vb0 >> 3) & 0x7,
+                       tl.where(pos[None, :] == 2, ((vb0 >> 6) & 0x3) | ((vb1 & 0x1) << 2),
+                       tl.where(pos[None, :] == 3, (vb1 >> 1) & 0x7,
+                       tl.where(pos[None, :] == 4, (vb1 >> 4) & 0x7,
+                       tl.where(pos[None, :] == 5, ((vb1 >> 7) & 0x1) | ((vb2 & 0x3) << 1),
+                       tl.where(pos[None, :] == 6, (vb2 >> 2) & 0x7,
+                                                    (vb2 >> 5) & 0x7)))))))
+            v_lo_val = tl.load(centroids_3bit_ptr + v_lo_idx)
+            o_lo += tl.sum(wp[:, None] * v_lo_val, axis=0)
+
+    # ---- Store output ----
+    inv_l = 1.0 / l
+    out_base = seq_id * out_stride_seq + q_head * out_stride_head
+    tl.store(output_rot_ptr + out_base + tl.arange(0, PACKED_4BIT_DIM) * 2,
+             o_hi_even * inv_l)
+    tl.store(output_rot_ptr + out_base + tl.arange(0, PACKED_4BIT_DIM) * 2 + 1,
+             o_hi_odd * inv_l)
+    tl.store(output_rot_ptr + out_base + HALF_DIM + tl.arange(0, HALF_DIM),
+             o_lo * inv_l)
+
+
+def turboquant_paged_fused_attention_decode(
+    q_rot: torch.Tensor,         # [num_seqs, num_q_heads, head_dim] FP16, pre-rotated+scaled
+    kv_cache: torch.Tensor,      # [num_blocks, 2, block_size, slot_bytes] uint8
+    block_table: torch.Tensor,   # [num_seqs, max_blocks_per_seq] int32
+    seq_lens: torch.Tensor,      # [num_seqs] int32
+    num_kv_heads: int,
+    head_dim: int = 128,
+) -> torch.Tensor:
+    """Paged fused TQ3.5 decode — CUDA-graph safe.
+
+    Takes pre-rotated query (WHT already applied). Returns output in WHT space.
+    Caller handles WHT rotation of Q and inverse WHT of output.
+    """
+    num_seqs, num_q_heads = q_rot.shape[0], q_rot.shape[1]
+    device = q_rot.device
+    block_size = kv_cache.shape[2]
+    half_dim = head_dim // 2
+    packed_4bit_dim = half_dim // 2
+    packed_3bit_dim = half_dim * 3 // 8
+    packed_dim = packed_4bit_dim + packed_3bit_dim
+    tq_bytes_per_head = packed_dim + 2
+
+    c4 = get_centroids(4, head_dim, device, torch.float32)
+    c3 = get_centroids(3, head_dim, device, torch.float32)
+
+    output_rot = torch.empty(num_seqs, num_q_heads, head_dim,
+                             device=device, dtype=torch.float32)
+
+    # Choose BLOCK_KV tile size — must divide BLOCK_SIZE evenly
+    block_kv = 32
+    if block_size % block_kv != 0:
+        block_kv = 16
+    if block_size % block_kv != 0:
+        block_kv = 8
+    if block_size % block_kv != 0:
+        block_kv = 1  # fallback
+
+    grid = (num_q_heads, num_seqs)
+    _tq_paged_fused_attn_35_kernel[grid](
+        q_rot, kv_cache, block_table, seq_lens,
+        output_rot, c4, c3,
+        q_rot.stride(0), q_rot.stride(1),
+        kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+        block_table.stride(0),
+        output_rot.stride(0), output_rot.stride(1),
+        BLOCK_SIZE=block_size,
+        HALF_DIM=half_dim,
+        PACKED_4BIT_DIM=packed_4bit_dim,
+        PACKED_3BIT_DIM=packed_3bit_dim,
+        TQ_BYTES_PER_HEAD=tq_bytes_per_head,
+        NUM_KV_HEADS=num_kv_heads,
+        Q_HEADS_PER_KV=num_q_heads // num_kv_heads,
+        BLOCK_KV=block_kv,
+        num_warps=4, num_stages=1,
+    )
+    return output_rot
+
+
+def turboquant_fused_attention_decode(
+    query: torch.Tensor,        # [num_q_heads, head_dim] FP16
+    packed_k: torch.Tensor,     # [num_kv_tokens, num_kv_heads, packed_dim] uint8
+    norms_k: torch.Tensor,      # [num_kv_tokens, num_kv_heads] FP16
+    packed_v: torch.Tensor,     # [num_kv_tokens, num_kv_heads, packed_dim] uint8
+    norms_v: torch.Tensor,      # [num_kv_tokens, num_kv_heads] FP16
+    head_dim: int = 128,
+    scale: float = None,
+    had_fn=None,
+) -> torch.Tensor:
+    """Fused TQ3.5 decode attention — no FP16 cache materialization.
+
+    Single-token decode: reads compressed KV directly, computes full
+    attention output in one pass. HBM traffic = compressed TQ only.
+
+    Algorithm:
+      1. WHT-rotate query once
+      2. For each KV token: score via centroid dot product (WHT space)
+      3. Online softmax
+      4. V accumulation in WHT space (centroids × weights)
+      5. One inverse WHT on accumulated output
+
+    Returns:
+        output: [num_q_heads, head_dim] FP16
+    """
+    num_q_heads = query.shape[0]
+    num_kv_tokens, num_kv_heads = norms_k.shape
+    device = query.device
+    half_dim = head_dim // 2
+
+    if scale is None:
+        scale = head_dim ** -0.5
+
+    # Rotate query and apply scale
+    q_rot = _apply_wht(query.unsqueeze(0), head_dim, had_fn).squeeze(0)
+    q_rot = (q_rot.float() * scale).half()
+    q_rot = q_rot.contiguous()
+
+    c4 = get_centroids(4, head_dim, device, torch.float32)
+    c3 = get_centroids(3, head_dim, device, torch.float32)
+
+    output_rot = torch.empty(num_q_heads, head_dim, device=device, dtype=torch.float32)
+
+    grid = (num_q_heads,)
+    _tq_fused_attn_decode_35_v2_kernel[grid](
+        q_rot, packed_k, norms_k, packed_v, norms_v,
+        output_rot, c4, c3,
+        q_rot.stride(0),
+        packed_k.stride(0), packed_k.stride(1),
+        norms_k.stride(0),
+        output_rot.stride(0),
+        num_kv_tokens,
+        HALF_DIM=half_dim,
+        PACKED_4BIT_DIM=half_dim // 2,
+        PACKED_3BIT_DIM=half_dim * 3 // 8,
+        Q_HEADS_PER_KV=num_q_heads // num_kv_heads,
+        BLOCK_KV=32,
+        num_warps=4, num_stages=1,
+    )
+
+    # Inverse WHT (single matmul at end)
+    output = _apply_wht(output_rot.half(), head_dim, had_fn)
+    return output
+
+
+# ---------------------------------------------------------------------------
 # Unpacked fallback (Phase 1 compatibility, used if Triton unavailable)
 # ---------------------------------------------------------------------------
 

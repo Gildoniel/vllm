@@ -235,17 +235,11 @@ class RocmAttentionBackend(AttentionBackend):
             raise ValueError("Block size must be a multiple of 16.")
         if cache_dtype_str.startswith("tq"):
             # TurboQuant: packed bytes layout
-            # Per head: packed_dim + 2 bytes (FP16 norm)
-            if cache_dtype_str == "tq35":
-                half = head_size // 2
-                packed_dim = half // 2 + half * 3 // 8
-            elif cache_dtype_str == "tq3":
-                packed_dim = head_size * 3 // 8
-            else:  # tq4
-                packed_dim = head_size * 4 // 8
-            bytes_per_head = packed_dim + 2
-            total_bytes = bytes_per_head * num_kv_heads
-            return (num_blocks, 2, block_size, total_bytes)
+            # Use same last-dim as standard (num_kv_heads * head_size) so that
+            # the shape product matches the page allocation (which may be padded
+            # for Mamba alignment). TQ decode only reads the first
+            # bytes_per_head * num_kv_heads bytes from each slot.
+            return (num_blocks, 2, block_size, num_kv_heads * head_size)
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -418,7 +412,14 @@ class RocmAttentionImpl(AttentionImpl):
             )
 
         if self.is_tq_cache:
-            # TurboQuant: decode cache to FP16, then run standard attention
+            is_pure_decode = (attn_metadata.max_query_len == 1
+                              and self.tq_bits == 35)
+            if is_pure_decode:
+                # Fused TQ attention: read compressed KV directly, no FP16
+                self._forward_tq_fused_decode(
+                    query, key, value, kv_cache, attn_metadata, output)
+                return output
+            # Prefill / mixed: decode cache to FP16, run standard attention
             fp16_cache = self._decode_tq_cache(kv_cache, attn_metadata)
             # fp16_cache: [2, num_blocks, block_size, num_kv_heads, head_size]
             key_cache, value_cache = PagedAttention.split_kv_cache(
@@ -533,6 +534,45 @@ class RocmAttentionImpl(AttentionImpl):
 
         return fp16_cache
 
+    def _forward_tq_fused_decode(
+        self,
+        query: torch.Tensor,      # [num_tokens, num_heads, head_size]
+        key: torch.Tensor,         # [num_tokens, num_kv_heads, head_size]
+        value: torch.Tensor,       # [num_tokens, num_kv_heads, head_size]
+        kv_cache: torch.Tensor,    # [num_blocks, 2, block_size, total_bytes]
+        attn_metadata,
+        output: torch.Tensor,      # [num_tokens, num_heads, head_size]
+    ):
+        """Fused TQ3.5 decode attention — CUDA-graph safe.
+
+        Uses a single paged Triton kernel that reads block_table and seq_lens
+        as GPU tensors. No Python loops or .item() calls.
+        """
+        from vllm.v1.attention.ops.turboquant_kv import (
+            turboquant_paged_fused_attention_decode,
+            _apply_wht,
+        )
+
+        num_actual = attn_metadata.num_actual_tokens
+        block_table = attn_metadata.block_table
+        seq_lens = attn_metadata.seq_lens
+
+        # WHT-rotate all queries at once: [N, H, D] → [N, H, D]
+        q = query[:num_actual]  # [N, num_q_heads, head_size]
+        q_rot = _apply_wht(q, self.head_size)
+        q_rot = (q_rot.float() * self.scale).half().contiguous()
+
+        # Paged fused attention in WHT space
+        output_rot = turboquant_paged_fused_attention_decode(
+            q_rot, kv_cache, block_table, seq_lens,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_size,
+        )
+
+        # Inverse WHT on output: [N, H, D]
+        out = _apply_wht(output_rot.half(), self.head_size)
+        output[:num_actual] = out
+
     def do_kv_cache_update(
         self,
         layer: AttentionLayer,
@@ -634,9 +674,12 @@ class RocmAttentionImpl(AttentionImpl):
             slot_data = torch.cat([packed, norms_bytes], dim=-1)
             # Flatten heads into single byte row: [N, num_kv_heads * bph]
             slot_data_flat = slot_data.reshape(kv_valid.shape[0], -1)
+            tq_bytes = slot_data_flat.shape[1]
 
-            # Vectorized scatter via advanced indexing
-            kv_cache[block_indices, kv_idx, block_offsets] = slot_data_flat
+            # Vectorized scatter — write only TQ bytes (cache slots may
+            # be wider due to Mamba page alignment padding)
+            kv_cache[block_indices, kv_idx, block_offsets, :tq_bytes] = \
+                slot_data_flat
 
     def fused_rope_kvcache_supported(self):
         return rocm_aiter_ops.is_enabled()
