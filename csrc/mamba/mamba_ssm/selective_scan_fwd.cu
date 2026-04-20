@@ -8,7 +8,7 @@
 #include <c10/util/BFloat16.h>
 #include <c10/util/Half.h>
 #ifdef USE_ROCM
-    #include <c10/hip/HIPException.h>  // For C10_HIP_CHECK and C10_HIP_KERNEL_LAUNCH_CHECK
+    #include <c10/hip/HIPException.h>  // For C10_HIP_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
 #else
     #include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
 #endif
