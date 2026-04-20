@@ -6309,8 +6309,9 @@ class GPUModelRunner(
                         kv_cache_stride_order.index(i)
                         for i in range(len(kv_cache_stride_order))
                     ]
+                    raw = kv_cache_raw_tensors[layer_name]
                     kv_caches[layer_name] = (
-                        kv_cache_raw_tensors[layer_name]
+                        raw
                         .view(dtype)
                         .view(kv_cache_shape)
                         .permute(*inv_order)

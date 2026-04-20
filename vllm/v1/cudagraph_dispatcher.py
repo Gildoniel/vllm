@@ -343,10 +343,17 @@ class CudagraphDispatcher:
         if not self.keys_initialized or self.cudagraph_mode == CUDAGraphMode.NONE:
             return []
 
+        max_cap = self.compilation_config.max_cudagraph_capture_size
         result = []
         # Return in order: PIECEWISE first, then FULL
         for mode in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]:
             descs = list(self.cudagraph_keys[mode])
+            # Filter out batch sizes that exceed current max capture size
+            # (may have been reduced by Mamba cache block capping)
+            if max_cap is not None and max_cap > 0:
+                descs = [d for d in descs if d.num_tokens <= max_cap]
+            elif max_cap == 0:
+                continue
             if descs:
                 # Sort by (num_tokens, num_active_loras) descending
                 descs.sort(

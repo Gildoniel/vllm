@@ -28,6 +28,12 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+
+from vllm.v1.attention.ops.turboquant_kv import (
+    turboquant_encode, turboquant_encode_35,
+    turboquant_decode, turboquant_decode_35,
+    turboquant_paged_fused_attention_decode, _get_had_matrix,
+)
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -294,6 +300,19 @@ class TritonAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        if cache_dtype_str.startswith("tq"):
+            # TQ: packed bytes per head. dtype=uint8, so shape product = bytes.
+            # bytes_per_head includes packed indices + FP16 norm.
+            if cache_dtype_str == "tq3":
+                bytes_per_head = head_size * 3 // 8 + 2
+            elif cache_dtype_str == "tq35":
+                half = head_size // 2
+                bytes_per_head = half // 2 + half * 3 // 8 + 2
+            elif cache_dtype_str == "tq4":
+                bytes_per_head = head_size * 4 // 8 + 2
+            else:
+                bytes_per_head = head_size
+            return (num_blocks, 2, block_size, num_kv_heads, bytes_per_head)
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
@@ -404,6 +423,11 @@ class TritonAttentionImpl(AttentionImpl):
         self.use_alibi_sqrt = use_alibi_sqrt
         self.supports_quant_query_input = current_platform.is_cuda()
 
+        # TurboQuant KV cache support
+        self.is_tq_cache = kv_cache_dtype.startswith("tq")
+        if self.is_tq_cache:
+            self.tq_bits = int(kv_cache_dtype[2:])
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -467,8 +491,32 @@ class TritonAttentionImpl(AttentionImpl):
             )
 
         # For decoder and cross-attention, use KV cache as before
-        key_cache, value_cache = kv_cache.unbind(1)
-        if self.kv_cache_dtype.startswith("fp8"):
+        if self.is_tq_cache:
+
+            is_pure_decode = (attn_metadata.max_query_len == 1
+                              and self.tq_bits == 35)
+            if is_pure_decode:
+                # Fused TQ decode attention
+                had = _get_had_matrix(self.head_size, query.device).to(query.dtype)
+                q = query[:num_actual_tokens]
+                q_rot = torch.matmul(q.float(), had.float()).to(q.dtype) * self.scale
+                # Flatten for fused decode: [num_blocks, 2, block_size, total_bytes]
+                tq_cache_flat = kv_cache.reshape(kv_cache.shape[0], 2, kv_cache.shape[2], -1)
+                out_rot = turboquant_paged_fused_attention_decode(
+                    q_rot, tq_cache_flat, attn_metadata.block_table,
+                    attn_metadata.seq_lens, self.num_kv_heads, self.head_size)
+                out_fp16 = torch.matmul(out_rot.float(), had.float()).to(q.dtype)
+                output[:num_actual_tokens] = out_fp16.reshape(
+                    num_actual_tokens, -1, self.head_size)
+                return output
+            # Prefill/mixed: decode TQ cache to FP16
+            # Squeeze the dummy heads dim for TQ ops
+            fp16_cache = self._decode_tq_cache_inline(
+                kv_cache, attn_metadata)
+            key_cache, value_cache = fp16_cache.unbind(1)
+        else:
+            key_cache, value_cache = kv_cache.unbind(1)
+        if not self.is_tq_cache and self.kv_cache_dtype.startswith("fp8"):
             if key_cache.dtype != self.fp8_dtype:
                 key_cache = key_cache.view(self.fp8_dtype)
                 value_cache = value_cache.view(self.fp8_dtype)
@@ -521,6 +569,44 @@ class TritonAttentionImpl(AttentionImpl):
         )
 
         return output
+
+
+    def _decode_tq_cache_inline(self, kv_cache, attn_metadata):
+        """Decode TQ-packed KV cache to FP16 for standard attention.
+        CUDA-graph safe: decodes ALL blocks (no dynamic shapes).
+        kv_cache: [num_blocks, 2, block_size, num_kv_heads, bytes_per_head]
+        Returns: [num_blocks, 2, block_size, num_kv_heads, head_size] FP16
+        """
+
+        bits = self.tq_bits
+        head_size = self.head_size
+        num_kv_heads = self.num_kv_heads
+        num_blocks = kv_cache.shape[0]
+        block_size = kv_cache.shape[2]
+        bytes_per_head = kv_cache.shape[4]
+        packed_dim = bytes_per_head - 2
+
+        N = num_blocks * block_size
+        fp16_cache = torch.empty(
+            num_blocks, 2, block_size, num_kv_heads, head_size,
+            dtype=torch.float16, device=kv_cache.device)
+
+        for kv_idx in range(2):
+            all_data = kv_cache[:, kv_idx]  # [num_blocks, block_size, num_kv_heads, bytes_per_head]
+            all_flat = all_data.reshape(N, num_kv_heads, bytes_per_head)
+            packed_all = all_flat[:, :, :packed_dim].contiguous()
+            norms_raw = all_flat[:, :, packed_dim:].contiguous()
+            norms_all = norms_raw.view(torch.float16).squeeze(-1)
+
+            if bits == 35:
+                decoded = turboquant_decode_35(packed_all, norms_all,
+                                              head_dim=head_size)
+            else:
+                decoded = turboquant_decode(packed_all, norms_all, bits=bits)
+            fp16_cache[:, kv_idx] = decoded.reshape(
+                num_blocks, block_size, num_kv_heads, head_size)
+
+        return fp16_cache
 
     def _forward_encoder_attention(
         self,
@@ -581,6 +667,38 @@ class TritonAttentionImpl(AttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
         # For decoder and cross-attention, use KV cache as before
+        if self.is_tq_cache:
+            # TurboQuant path: encode K/V to packed format
+            # CUDA-graph safe: no boolean indexing or dynamic shapes
+
+            bits = self.tq_bits
+            block_size = kv_cache.shape[2]
+            num_tokens = key.shape[0]
+            if num_tokens == 0:
+                return
+            # Clamp negative slots to 0 (will be overwritten harmlessly)
+            safe_slots = torch.clamp(slot_mapping, min=0)
+            block_indices = safe_slots // block_size
+            block_offsets = safe_slots % block_size
+            valid_mask = slot_mapping >= 0  # [num_tokens] bool
+            cache_flat = kv_cache.view(
+                kv_cache.shape[0], 2, kv_cache.shape[2], -1)
+            for kv_idx, kv_tensor in enumerate([key, value]):
+                # Encode ALL tokens (including padding — harmless)
+                if bits == 35:
+                    packed, norms = turboquant_encode_35(kv_tensor)
+                else:
+                    packed, norms = turboquant_encode(kv_tensor, bits=bits)
+                norms_bytes = norms.view(torch.uint8).reshape(
+                    num_tokens, self.num_kv_heads, 2)
+                slot_data = torch.cat([packed, norms_bytes], dim=-1)
+                slot_data_flat = slot_data.reshape(num_tokens, -1)
+                tq_bytes = slot_data_flat.shape[1]
+                # Write to cache — invalid slots write to [0,0] harmlessly
+                cache_flat[block_indices, kv_idx, block_offsets,
+                           :tq_bytes] = slot_data_flat
+            return
+
         key_cache, value_cache = kv_cache.unbind(1)
 
         # Reshape the input keys and values and store them in the cache.

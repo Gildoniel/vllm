@@ -1128,9 +1128,8 @@ def get_kv_cache_config_from_groups(
         # full.1, sw.2: share another Tensor with size=available_memory//2
         group_size = max(len(group.layer_names) for group in kv_cache_groups)
 
-        page_size = get_uniform_page_size(
-            [group.kv_cache_spec for group in kv_cache_groups]
-        )
+        specs_for_debug = [group.kv_cache_spec for group in kv_cache_groups]
+        page_size = get_uniform_page_size(specs_for_debug)
         assert group_size > 0, "group_size must be greater than 0"
         num_blocks = get_num_blocks(
             vllm_config, group_size, available_memory, page_size

@@ -186,6 +186,7 @@ class FullAttentionSpec(AttentionSpec):
             head_size_v=specs[0].head_size_v,
             dtype=specs[0].dtype,
             page_size_padded=specs[0].page_size_padded,
+            kv_cache_dtype_str=specs[0].kv_cache_dtype_str,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
         )
@@ -205,6 +206,9 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.kv_cache_dtype_str and self.kv_cache_dtype_str.startswith("tq"):
+            return _tq_page_size(self.block_size, self.num_kv_heads,
+                                 self.head_size, self.kv_cache_dtype_str)
         return (
             self.block_size
             * self.num_kv_heads

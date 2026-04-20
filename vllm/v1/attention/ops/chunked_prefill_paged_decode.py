@@ -160,9 +160,10 @@ def kernel_paged_attention_2d(
         )
 
         # K : (HEAD_SIZE, BLOCK_SIZE)
+        seq_valid_k = (j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE))[None, :] < seq_len
         K_load = tl.load(
             key_cache_ptr + k_offset,
-            mask=dim_mask[:, None],
+            mask=dim_mask[:, None] & seq_valid_k,
             other=0.0,
             eviction_policy="evict_last",
         )
@@ -173,9 +174,13 @@ def kernel_paged_attention_2d(
             K = K_load
 
         # V : (BLOCK_SIZE, HEAD_SIZE)
+        # Must mask both dim padding AND sequence padding to avoid NaN from
+        # uninitialized FP16 cache slots (0 * NaN = NaN in IEEE 754).
+        # FP8 is immune because fp8_e4m3fnuz has no NaN representations.
+        seq_valid = (j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE))[:, None] < seq_len
         V_load = tl.load(
             value_cache_ptr + v_offset,
-            mask=dim_mask[None, :],
+            mask=dim_mask[None, :] & seq_valid,
             other=0.0,
             eviction_policy="evict_last",
         )
