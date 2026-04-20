@@ -782,10 +782,24 @@ class EXL3LinearMethod(LinearMethodBase):
             # RowParallel: output_partition_sizes are already full size
             full_output_partition_sizes = list(output_partition_sizes)
         else:
-            # ColumnParallel: output_partition_sizes are per-TP-rank
-            full_output_partition_sizes = [
-                s * tp_size for s in output_partition_sizes
-            ]
+            # ColumnParallel: output_partition_sizes are per-TP-rank.
+            # For QKV with GQA, K/V can be replicated when TP > num_kv_heads.
+            # In that case, the actual full K/V in the checkpoint is
+            # per_rank * (tp_size / num_kv_head_replicas), NOT per_rank * tp_size.
+            num_kv_head_replicas = getattr(layer, "num_kv_head_replicas", 1)
+            if num_kv_head_replicas > 1 and len(output_partition_sizes) == 3:
+                # QKV: index 0=Q (no replication), 1=K, 2=V (both replicated)
+                full_output_partition_sizes = [
+                    output_partition_sizes[0] * tp_size,
+                    output_partition_sizes[1] * tp_size
+                    // num_kv_head_replicas,
+                    output_partition_sizes[2] * tp_size
+                    // num_kv_head_replicas,
+                ]
+            else:
+                full_output_partition_sizes = [
+                    s * tp_size for s in output_partition_sizes
+                ]
         full_output_size = sum(full_output_partition_sizes)
 
         # Use full-size loader (no TP sharding for EXL3 params)
@@ -1063,9 +1077,20 @@ class EXL3LinearMethod(LinearMethodBase):
                 tp_start = tp_rank * k_per_tp
                 sharded_weight = full_weight[tp_start:tp_start + k_per_tp, :]
             else:
-                # ColumnParallel: TP-shard the output (N) dimension
+                # ColumnParallel: TP-shard the output (N) dimension.
+                # For QKV with GQA, K/V are replicated across ranks when
+                # TP > num_kv_heads (e.g. TP=8 with 4 KV heads -> replicas=2,
+                # ranks 0+1 share KV head 0, ranks 2+3 share KV head 1, ...)
                 n_per_tp = output_partition_sizes[i]
-                tp_start = tp_rank * n_per_tp
+                num_kv_head_replicas = getattr(
+                    layer, "num_kv_head_replicas", 1)
+                if (i > 0 and len(output_partition_sizes) == 3
+                        and num_kv_head_replicas > 1):
+                    # K (i=1) or V (i=2) sub-projection with replication
+                    shard_rank = tp_rank // num_kv_head_replicas
+                else:
+                    shard_rank = tp_rank
+                tp_start = shard_rank * n_per_tp
                 sharded_weight = full_weight[:, tp_start:tp_start + n_per_tp]
             fp16_columns.append(sharded_weight)
 
