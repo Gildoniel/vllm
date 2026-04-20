@@ -76,6 +76,7 @@ from .interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
     _require_is_multimodal,
 )
@@ -520,6 +521,7 @@ class Qwen3_5ForCausalLMBase(
     HasInnerState,
     IsHybrid,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
 ):
     packed_modules_mapping = {
@@ -656,7 +658,14 @@ class Qwen3_5ForCausalLMBase(
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
-    pass
+    def get_mrope_input_positions(self, input_tokens, mm_features):
+        # Text-only: M-RoPE collapses to uniform 1D positions broadcast on (T,H,W).
+        import numpy as np
+        text_len = len(input_tokens)
+        positions = torch.from_numpy(
+            np.broadcast_to(np.arange(text_len, dtype=np.int64), (3, text_len)).copy()
+        )
+        return positions, 0
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
