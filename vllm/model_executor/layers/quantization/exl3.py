@@ -190,11 +190,29 @@ def _load_trellis(param: "EXL3TrellisParameter", loaded_weight: torch.Tensor,
     loaded_weight = loaded_weight.narrow(1, shard_rank * tile_size,
                                          tile_size)
     param_data = param.data.narrow(1, tile_offset, tile_size)
-    assert param_data.shape == loaded_weight.shape, (
-        f"Trellis shape mismatch: param_slice={param_data.shape}, "
-        f"loaded={loaded_weight.shape}, shard_id={shard_id}"
-    )
-    param_data.copy_(loaded_weight)
+    if param_data.shape[2] != loaded_weight.shape[2]:
+        # Mixed-K: sub-projection has different words_per_tile
+        # than allocated param (allocated with max K). Zero-pad.
+        wpt_loaded = loaded_weight.shape[2]
+        wpt_param = param_data.shape[2]
+        assert param_data.shape[:2] == loaded_weight.shape[:2], (
+            f"Trellis shape mismatch (dims 0,1): "
+            f"param_slice={param_data.shape}, loaded={loaded_weight.shape}"
+        )
+        if wpt_loaded <= wpt_param:
+            param_data[:, :, :wpt_loaded].copy_(loaded_weight)
+            param_data[:, :, wpt_loaded:].zero_()
+        else:
+            assert False, (
+                f"Trellis words_per_tile overflow: "
+                f"param={wpt_param}, loaded={wpt_loaded}"
+            )
+    else:
+        assert param_data.shape == loaded_weight.shape, (
+            f"Trellis shape mismatch: param_slice={param_data.shape}, "
+            f"loaded={loaded_weight.shape}, shard_id={shard_id}"
+        )
+        param_data.copy_(loaded_weight)
 
 
 def _load_suh(param: "EXL3SuhParameter", loaded_weight: torch.Tensor,
@@ -590,6 +608,30 @@ class EXL3LinearMethod(LinearMethodBase):
                 )
                 had_incompatible = True
 
+        # Check for mixed bits_per_weight across sub-projections in
+        # merged layers (e.g. QKV where Q=4bpw, K=5bpw, V=6bpw).
+        # The trellis 3rd dimension depends on K, so merged trellis
+        # cannot hold sub-projections with different K values.
+        if not had_incompatible and num_projections > 1:
+            # Try to find per-sub-projection bits via packed_modules_mapping
+            layer_prefix = getattr(layer, "prefix", "")
+            proj_name = layer_prefix.split(".")[-1] if layer_prefix else ""
+            mapping = self.quant_config.packed_modules_mapping
+            if proj_name in mapping:
+                sub_bits = []
+                for sub in mapping[proj_name]:
+                    sub_prefix = layer_prefix.replace(proj_name, sub)
+                    b = self.quant_config._get_layer_bits(sub_prefix)
+                    if b is not None:
+                        sub_bits.append(b)
+                if sub_bits and len(set(sub_bits)) > 1:
+                    logger.info(
+                        "EXL3: mixed K values %s in merged %s — "
+                        "dequant to FP16",
+                        sub_bits, proj_name,
+                    )
+                    had_incompatible = True
+
         if had_incompatible:
             self._create_weights_dequant(
                 layer, input_size_per_partition, output_partition_sizes,
@@ -716,7 +758,20 @@ class EXL3LinearMethod(LinearMethodBase):
         # Full-size trellis
         tiles_k = input_size // 16
         tiles_n = full_output_size // 16
-        words_per_tile = 16 * self.bits
+
+        # For mixed-K layers, find the max bits across sub-projections
+        # so the trellis can hold all sub-projection data.
+        max_bits = self.bits
+        layer_prefix = getattr(layer, "prefix", "")
+        proj_name = layer_prefix.split(".")[-1] if layer_prefix else ""
+        mapping = self.quant_config.packed_modules_mapping
+        if proj_name in mapping:
+            for sub in mapping[proj_name]:
+                sub_prefix = layer_prefix.replace(proj_name, sub)
+                b = self.quant_config._get_layer_bits(sub_prefix)
+                if b is not None and b > max_bits:
+                    max_bits = b
+        words_per_tile = 16 * max_bits
 
         trellis = EXL3TrellisParameter(
             data=torch.zeros(
@@ -765,6 +820,17 @@ class EXL3LinearMethod(LinearMethodBase):
         layer.exl3_cb = self.quant_config.cb
         layer.exl3_output_partition_sizes = output_partition_sizes
         layer._exl3_dequant = True
+        # Per-projection bits for mixed-K merged layers
+        per_proj_bits = []
+        layer_prefix = getattr(layer, "prefix", "")
+        proj_name = layer_prefix.split(".")[-1] if layer_prefix else ""
+        mapping = self.quant_config.packed_modules_mapping
+        if proj_name in mapping:
+            for sub in mapping[proj_name]:
+                sub_prefix = layer_prefix.replace(proj_name, sub)
+                b = self.quant_config._get_layer_bits(sub_prefix)
+                per_proj_bits.append(b if b is not None else self.bits)
+        layer._exl3_per_proj_bits = per_proj_bits if per_proj_bits else None
         layer._exl3_dequant_full_output_sizes = full_output_partition_sizes
         layer._exl3_dequant_input_size = input_size
         layer._exl3_dequant_tp_size = tp_size
@@ -913,6 +979,12 @@ class EXL3LinearMethod(LinearMethodBase):
             proj_n = full_output_sizes[i]
             proj_tiles = proj_n // 16
             proj_trellis = trellis.narrow(1, tile_offset, proj_tiles)
+            # For mixed-K: trim trellis to actual words_per_tile for this proj
+            per_proj_bits = getattr(layer, '_exl3_per_proj_bits', None)
+            proj_bits = per_proj_bits[i] if per_proj_bits else bits
+            actual_wpt = 16 * proj_bits
+            if proj_trellis.shape[2] > actual_wpt:
+                proj_trellis = proj_trellis[:, :, :actual_wpt].contiguous()
             proj_trellis_i32 = proj_trellis.contiguous().view(torch.int32)
             proj_svh = svh[out_offset:out_offset + proj_n]
 
@@ -934,7 +1006,7 @@ class EXL3LinearMethod(LinearMethodBase):
 
                 # GEMM
                 proj_out = exl3_gemm(
-                    xh, proj_trellis, bits=bits, cb=cb,
+                    xh, proj_trellis, bits=proj_bits, cb=cb,
                     B_i32=proj_trellis_i32,
                 )
 
