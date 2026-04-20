@@ -518,6 +518,7 @@ class Qwen3_5Model(Qwen3NextModel):
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
+    IsHybrid,
     SupportsLoRA,
     SupportsPP,
 ):
@@ -530,7 +531,6 @@ class Qwen3_5ForCausalLMBase(
         "gate_up_proj": ["gate_proj", "up_proj"],
         # GDN fused projections.
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
-        "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -595,12 +595,64 @@ class Qwen3_5ForCausalLMBase(
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: "VllmConfig"
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        parallel_config = vllm_config.parallel_config
+        hf_config = vllm_config.model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+            tp_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            num_spec,
+        )
+
+    @classmethod
+    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Skip mtp layers and EXL3 tensors on tied lm_head (no separate lm_head
+        # module exists when tie_word_embeddings=True, so EXL3 trellis/suh/svh
+        # and codebook markers have no target)
+        skip = ["mtp."]
+        if getattr(self.config, "tie_word_embeddings", False):
+            skip.extend(["lm_head.trellis", "lm_head.suh", "lm_head.svh",
+                         "lm_head.mcg", "lm_head.mul1"])
+
+        def _remap_vl_prefix(weights_iter):
+            """Remap VL model prefix (model.language_model.X) to CausalLM
+            prefix (model.X) so VL-quantized checkpoints load into CausalLM."""
+            for name, tensor in weights_iter:
+                name = name.replace("model.language_model.", "model.", 1)
+                yield name, tensor
+
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=["mtp."],
+            skip_prefixes=skip,
         )
-        return loader.load_weights(weights)
+        return loader.load_weights(_remap_vl_prefix(weights))
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
@@ -632,9 +684,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
     # Qwen3.5 does not support multimodal pruning (EVS).
     supports_multimodal_pruning = False
 
-    packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
+    packed_modules_mapping = {
+        **Qwen3VLForConditionalGeneration.packed_modules_mapping,
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
-        "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
