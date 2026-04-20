@@ -170,13 +170,41 @@ def _load_trellis(param: "EXL3TrellisParameter", loaded_weight: torch.Tensor,
         return
 
     idx = _shard_idx(shard_id)
-    # Fused multi-shard: idx is (start, stop) tuple
+    # Fused multi-shard: idx is (start, stop) tuple. Iterate per sub-shard
+    # because the checkpoint tensor has [sub0_full, sub1_full, ...] FLAT
+    # layout; each sub must be TP-sharded independently.
     if isinstance(idx, tuple):
-        shard_offset = sum(output_sizes[:idx[0]])
-        shard_size = sum(output_sizes[idx[0]:idx[1]])
-    else:
-        shard_offset = sum(output_sizes[:idx])
-        shard_size = output_sizes[idx]
+        loaded_tile_offset = 0
+        for sub in range(idx[0], idx[1]):
+            sub_size = output_sizes[sub]  # per-rank
+            sub_tiles = sub_size // 16
+            full_sub_tiles = sub_tiles * tp_size
+            shard_rank_sub = tp_rank  # no GQA replication in tuple case
+            src = loaded_weight.narrow(
+                1, loaded_tile_offset + shard_rank_sub * sub_tiles,
+                sub_tiles)
+            param_tile_offset = sum(output_sizes[:sub]) // 16
+            dst = param.data.narrow(1, param_tile_offset, sub_tiles)
+            if dst.shape[2] != src.shape[2]:
+                wpt_loaded = src.shape[2]
+                wpt_param = dst.shape[2]
+                if wpt_loaded <= wpt_param:
+                    dst[:, :, :wpt_loaded].copy_(src)
+                    dst[:, :, wpt_loaded:].zero_()
+                else:
+                    assert False, (
+                        "Trellis wpt overflow (tuple): "
+                        f"param={wpt_param}, loaded={wpt_loaded}")
+            else:
+                assert dst.shape == src.shape, (
+                    f"Trellis shape mismatch (tuple sub={sub}): "
+                    f"param_slice={dst.shape}, loaded={src.shape}")
+                dst.copy_(src)
+            loaded_tile_offset += full_sub_tiles
+        return
+
+    shard_offset = sum(output_sizes[:idx])
+    shard_size = output_sizes[idx]
 
     tile_offset = shard_offset // 16
     tile_size = shard_size // 16
@@ -295,13 +323,23 @@ def _load_svh(param: "EXL3ScaleParameter", loaded_weight: torch.Tensor,
         return
 
     idx = _shard_idx(shard_id)
-    # Fused multi-shard: idx is (start, stop) tuple
+    # Fused multi-shard: load each sub-shard separately with its own TP slice.
+    # Checkpoint has flat [sub0_full, sub1_full, ...] layout; naive contiguous
+    # narrow would break it (rank 0 gets [q_all, k_all], rank 1 gets [v_all]).
     if isinstance(idx, tuple):
-        shard_offset = sum(output_sizes[:idx[0]])
-        shard_size = sum(output_sizes[idx[0]:idx[1]])
-    else:
-        shard_offset = sum(output_sizes[:idx])
-        shard_size = output_sizes[idx]
+        loaded_offset = 0
+        for sub in range(idx[0], idx[1]):
+            sub_size = output_sizes[sub]  # per-rank
+            full_sub_size = sub_size * tp_size
+            src = loaded_weight.narrow(
+                0, loaded_offset + tp_rank * sub_size, sub_size)
+            param_offset = sum(output_sizes[:sub])
+            param.data.narrow(0, param_offset, sub_size).copy_(src)
+            loaded_offset += full_sub_size
+        return
+
+    shard_offset = sum(output_sizes[:idx])
+    shard_size = output_sizes[idx]
 
     # output_sizes are already TP-divided (output_partition_sizes), so
     # shard_size and shard_offset are per-TP-rank values.  Index into
