@@ -408,7 +408,7 @@ void selective_scan_fwd_launch(SSMParamsBase &params, cudaStream_t stream) {
                 auto kernel = &selective_scan_fwd_kernel<Ktraits>;
                 if (kSmemSize >= 48 * 1024) {
 #ifdef USE_ROCM
-                    C10_HIP_CHECK(hipFuncSetAttribute(
+                    C10_CUDA_CHECK(hipFuncSetAttribute(
                         reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
 #else
                     C10_CUDA_CHECK(cudaFuncSetAttribute(
