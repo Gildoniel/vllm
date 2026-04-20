@@ -243,3 +243,9 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# Local dev artifacts
+.rocprofv3/
+bench_*_results.json
+# Symlink to external project
+vllm/model_executor/layers/quantization/exl3_kernels/hip_kernels
