@@ -220,7 +220,7 @@ def get_supported_lora_modules(model: nn.Module) -> list[str]:
         if isinstance(module, (LinearBase,)):
             supported_lora_modules.add(name.split(".")[-1])
 
-        if isinstance(module, (FusedMoE,)):
+        if False and isinstance(module, (FusedMoE,)):  # ROCm: skip FusedMoE LoRA to avoid OOM
             supported_lora_modules.add(name.split(".")[-1])
 
     return list(supported_lora_modules)

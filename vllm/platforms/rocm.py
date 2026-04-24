@@ -142,7 +142,7 @@ def _get_gcn_arch() -> str:
 # Resolve once at module load. Uses amdsmi (no CUDA init) so Ray workers
 # can still set CUDA_VISIBLE_DEVICES after import.
 # These are plain Python bools — fully torch.compile/Dynamo safe.
-_GCN_ARCH = _get_gcn_arch()
+_GCN_ARCH = os.environ.get("VLLM_GCN_ARCH", "") or _get_gcn_arch()
 
 _ON_GFX1X = any(arch in _GCN_ARCH for arch in ["gfx11", "gfx12"])
 _ON_MI3XX = any(arch in _GCN_ARCH for arch in ["gfx942", "gfx950"])

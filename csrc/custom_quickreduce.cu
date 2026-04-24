@@ -5,7 +5,6 @@
 
 #ifdef USE_ROCM
 
-  #include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
   #include "quickreduce/quick_reduce.h"
 
 quickreduce::fptr_t init_custom_qr(int64_t rank, int64_t world_size,
@@ -60,7 +59,7 @@ void qr_all_reduce(quickreduce::fptr_t _fa, torch::Tensor& inp,
                    torch::Tensor& out, int64_t quant_level, bool cast_bf2half) {
   auto fa = reinterpret_cast<quickreduce::DeviceComms*>(_fa);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
-  auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+  auto stream = at::cuda::getCurrentHIPStream();
 
   TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
   TORCH_CHECK_EQ(inp.numel(), out.numel());
