@@ -101,6 +101,10 @@ def freeze_gc_heap() -> None:
     """
     # Ensure all static objects are pushed down to the oldest generation for
     # freeze
+    # ROCm: skip gc.collect to avoid segfault with ROCm C extensions
+    import os
+    if os.environ.get("VLLM_TARGET_DEVICE") == "rocm":
+        return
     gc.collect(0)
     gc.collect(1)
     gc.collect(2)

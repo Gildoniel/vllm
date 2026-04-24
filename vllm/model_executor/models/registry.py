@@ -1309,6 +1309,7 @@ def _run() -> None:
 
     with open(output_file, "wb") as f:
         f.write(pickle.dumps(result))
+    os._exit(0)  # Skip Python shutdown GC segfault on ROCm
 
 
 if __name__ == "__main__":

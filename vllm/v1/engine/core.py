@@ -1035,6 +1035,7 @@ class EngineCoreProc(EngineCore):
 
     @staticmethod
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
+        import gc; gc.set_threshold(0, 0, 0)  # ROCm: disable GC to prevent segfault
         """Launch EngineCore busy loop in background process."""
 
         # Ensure we can serialize transformer config after spawning

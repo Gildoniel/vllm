@@ -617,6 +617,7 @@ class WorkerProc:
                 enable_ep=vllm_config.parallel_config.enable_expert_parallel
             )
             self.worker.load_model()
+            pass  # _dbg("load_model DONE")
 
         # Set block size based on the attention backends
         current_platform.update_block_size_for_backend(vllm_config)
@@ -627,7 +628,9 @@ class WorkerProc:
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
+        pass  # _dbg("enable_envs_cache...")
         enable_envs_cache()
+        pass  # _dbg("WorkerProc.__init__ DONE")
 
     @staticmethod
     def make_worker_process(
@@ -774,6 +777,7 @@ class WorkerProc:
 
     @staticmethod
     def worker_main(*args, **kwargs):
+        import gc; gc.set_threshold(0, 0, 0)  # ROCm: disable GC to prevent segfault
         """Worker initialization and execution loops.
         This runs a background process"""
 
@@ -824,6 +828,7 @@ class WorkerProc:
             worker.monitor_death_pipe(death_pipe, shutdown_requested)
 
             # Send READY once we know everything is loaded
+            pass  # _dbg("sending READY signal")
             ready_writer.send(
                 {
                     "status": WorkerProc.READY_STR,
