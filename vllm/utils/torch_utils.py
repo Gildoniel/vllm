@@ -41,9 +41,6 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "int8": torch.int8,
     "fp8_inc": torch.float8_e4m3fn,
     "fp8_ds_mla": torch.uint8,
-    "tq3": torch.uint8,
-    "tq35": torch.uint8,
-    "tq4": torch.uint8,
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {
@@ -773,9 +770,16 @@ class ModuleName(OpaqueBase):  # type: ignore[misc]
 
 
 if HAS_OPAQUE_TYPE:
-    from torch._library.opaque_object import register_opaque_type
+    from torch._library.opaque_object import MemberType, register_opaque_type
 
-    register_opaque_type(ModuleName, typ="value")
+    # torch 2.12+: also expose `value` as an INLINED member so dynamo can
+    # read it when tracing moe_forward_shared (upstream gap, hits ROCm TP).
+    register_opaque_type(
+        ModuleName,
+        typ="value",
+        hoist=True,
+        members={"value": MemberType.INLINED},
+    )
 
 
 # Supports xccl with PyTorch versions >= 2.8.0.dev for XPU platform

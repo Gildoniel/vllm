@@ -170,37 +170,44 @@ def _load_trellis(param: "EXL3TrellisParameter", loaded_weight: torch.Tensor,
         return
 
     idx = _shard_idx(shard_id)
-    # Fused multi-shard: idx is (start, stop) tuple. Iterate per sub-shard
-    # because the checkpoint tensor has [sub0_full, sub1_full, ...] FLAT
-    # layout; each sub must be TP-sharded independently.
+    # Fused multi-shard: idx is (start, stop) tuple. Each sub-shard must
+    # be TP-sliced independently along its own checkpoint offsets,
+    # otherwise rank 0 gets full q+k and rank 1 full v on TP=2.
     if isinstance(idx, tuple):
-        loaded_tile_offset = 0
-        for sub in range(idx[0], idx[1]):
-            sub_size = output_sizes[sub]  # per-rank
-            sub_tiles = sub_size // 16
-            full_sub_tiles = sub_tiles * tp_size
-            shard_rank_sub = tp_rank  # no GQA replication in tuple case
-            src = loaded_weight.narrow(
-                1, loaded_tile_offset + shard_rank_sub * sub_tiles,
-                sub_tiles)
-            param_tile_offset = sum(output_sizes[:sub]) // 16
-            dst = param.data.narrow(1, param_tile_offset, sub_tiles)
-            if dst.shape[2] != src.shape[2]:
-                wpt_loaded = src.shape[2]
-                wpt_param = dst.shape[2]
-                if wpt_loaded <= wpt_param:
-                    dst[:, :, :wpt_loaded].copy_(src)
-                    dst[:, :, wpt_loaded:].zero_()
-                else:
-                    assert False, (
-                        "Trellis wpt overflow (tuple): "
-                        f"param={wpt_param}, loaded={wpt_loaded}")
-            else:
-                assert dst.shape == src.shape, (
-                    f"Trellis shape mismatch (tuple sub={sub}): "
-                    f"param_slice={dst.shape}, loaded={src.shape}")
-                dst.copy_(src)
-            loaded_tile_offset += full_sub_tiles
+        # output_sizes can be passed as either FULL sizes (pre-TP) or
+        # per-TP-partitioned sizes depending on call site.  Detect by
+        # comparing the fused sub-range sum against the checkpoint width.
+        fused_sum = sum(output_sizes[idx[0]:idx[1]])
+        ckpt_sub_width = loaded_weight.shape[1]
+        # tiles-space equivalent: loaded_weight is stored as tiles (/16)
+        if ckpt_sub_width * 16 == fused_sum:
+            # output_sizes are FULL (checkpoint width matches sum)
+            per_tp_sizes = [s // tp_size for s in output_sizes]
+        elif ckpt_sub_width * 16 == fused_sum * tp_size:
+            # output_sizes are per-TP (checkpoint = sum * tp_size)
+            per_tp_sizes = list(output_sizes)
+        else:
+            raise RuntimeError(
+                f"Cannot infer output_sizes layout: ckpt_width(tiles*16)="
+                f"{ckpt_sub_width*16}, sum(output_sizes[{idx[0]}:{idx[1]}])="
+                f"{fused_sum}, tp_size={tp_size}, output_sizes={output_sizes}"
+            )
+        param_off_tiles = sum(per_tp_sizes[:idx[0]]) // 16
+        ckpt_off_tiles = 0
+        for sub_idx in range(idx[0], idx[1]):
+            sub_per_tp_tiles = per_tp_sizes[sub_idx] // 16
+            sub_full_tiles = sub_per_tp_tiles * tp_size
+            src_start = ckpt_off_tiles + tp_rank * sub_per_tp_tiles
+            src = loaded_weight.narrow(1, src_start, sub_per_tp_tiles)
+            dst = param.data.narrow(1, param_off_tiles, sub_per_tp_tiles)
+            assert dst.shape == src.shape, (
+                f"Trellis sub-shard mismatch sub={sub_idx}: "
+                f"param={dst.shape}, ckpt_slice={src.shape}, "
+                f"per_tp_sizes={per_tp_sizes}, output_sizes={output_sizes}, "
+                f"loaded={loaded_weight.shape}, tp={tp_size}")
+            dst.copy_(src)
+            param_off_tiles += sub_per_tp_tiles
+            ckpt_off_tiles += sub_full_tiles
         return
 
     shard_offset = sum(output_sizes[:idx])
@@ -218,29 +225,11 @@ def _load_trellis(param: "EXL3TrellisParameter", loaded_weight: torch.Tensor,
     loaded_weight = loaded_weight.narrow(1, shard_rank * tile_size,
                                          tile_size)
     param_data = param.data.narrow(1, tile_offset, tile_size)
-    if param_data.shape[2] != loaded_weight.shape[2]:
-        # Mixed-K: sub-projection has different words_per_tile
-        # than allocated param (allocated with max K). Zero-pad.
-        wpt_loaded = loaded_weight.shape[2]
-        wpt_param = param_data.shape[2]
-        assert param_data.shape[:2] == loaded_weight.shape[:2], (
-            f"Trellis shape mismatch (dims 0,1): "
-            f"param_slice={param_data.shape}, loaded={loaded_weight.shape}"
-        )
-        if wpt_loaded <= wpt_param:
-            param_data[:, :, :wpt_loaded].copy_(loaded_weight)
-            param_data[:, :, wpt_loaded:].zero_()
-        else:
-            assert False, (
-                f"Trellis words_per_tile overflow: "
-                f"param={wpt_param}, loaded={wpt_loaded}"
-            )
-    else:
-        assert param_data.shape == loaded_weight.shape, (
-            f"Trellis shape mismatch: param_slice={param_data.shape}, "
-            f"loaded={loaded_weight.shape}, shard_id={shard_id}"
-        )
-        param_data.copy_(loaded_weight)
+    assert param_data.shape == loaded_weight.shape, (
+        f"Trellis shape mismatch: param_slice={param_data.shape}, "
+        f"loaded={loaded_weight.shape}, shard_id={shard_id}"
+    )
+    param_data.copy_(loaded_weight)
 
 
 def _load_suh(param: "EXL3SuhParameter", loaded_weight: torch.Tensor,
@@ -323,19 +312,37 @@ def _load_svh(param: "EXL3ScaleParameter", loaded_weight: torch.Tensor,
         return
 
     idx = _shard_idx(shard_id)
-    # Fused multi-shard: load each sub-shard separately with its own TP slice.
-    # Checkpoint has flat [sub0_full, sub1_full, ...] layout; naive contiguous
-    # narrow would break it (rank 0 gets [q_all, k_all], rank 1 gets [v_all]).
+    # Fused multi-shard: idx is (start, stop) tuple — TP-slice each sub
+    # independently along its own checkpoint offsets.
     if isinstance(idx, tuple):
-        loaded_offset = 0
-        for sub in range(idx[0], idx[1]):
-            sub_size = output_sizes[sub]  # per-rank
-            full_sub_size = sub_size * tp_size
-            src = loaded_weight.narrow(
-                0, loaded_offset + tp_rank * sub_size, sub_size)
-            param_offset = sum(output_sizes[:sub])
-            param.data.narrow(0, param_offset, sub_size).copy_(src)
-            loaded_offset += full_sub_size
+        # Detect FULL vs per-TP output_sizes (same logic as _load_trellis).
+        fused_sum = sum(output_sizes[idx[0]:idx[1]])
+        ckpt_width = loaded_weight.shape[0]
+        if ckpt_width == fused_sum:
+            per_tp_sizes = [s // tp_size for s in output_sizes]
+        elif ckpt_width == fused_sum * tp_size:
+            per_tp_sizes = list(output_sizes)
+        else:
+            raise RuntimeError(
+                f"svh: cannot infer output_sizes layout: ckpt_width="
+                f"{ckpt_width}, fused_sum={fused_sum}, tp={tp_size}, "
+                f"output_sizes={output_sizes}"
+            )
+        param_off = sum(per_tp_sizes[:idx[0]])
+        ckpt_off = 0
+        for sub_idx in range(idx[0], idx[1]):
+            sub_per_tp = per_tp_sizes[sub_idx]
+            sub_full = sub_per_tp * tp_size
+            src_start = ckpt_off + tp_rank * sub_per_tp
+            src = loaded_weight.narrow(0, src_start, sub_per_tp)
+            dst = param.data.narrow(0, param_off, sub_per_tp)
+            assert dst.shape == src.shape, (
+                f"svh sub-shard mismatch sub={sub_idx}: "
+                f"param={dst.shape}, ckpt_slice={src.shape}, "
+                f"per_tp_sizes={per_tp_sizes}, output_sizes={output_sizes}")
+            dst.copy_(src)
+            param_off += sub_per_tp
+            ckpt_off += sub_full
         return
 
     shard_offset = sum(output_sizes[:idx])
@@ -646,30 +653,6 @@ class EXL3LinearMethod(LinearMethodBase):
                 )
                 had_incompatible = True
 
-        # Check for mixed bits_per_weight across sub-projections in
-        # merged layers (e.g. QKV where Q=4bpw, K=5bpw, V=6bpw).
-        # The trellis 3rd dimension depends on K, so merged trellis
-        # cannot hold sub-projections with different K values.
-        if not had_incompatible and num_projections > 1:
-            # Try to find per-sub-projection bits via packed_modules_mapping
-            layer_prefix = getattr(layer, "prefix", "")
-            proj_name = layer_prefix.split(".")[-1] if layer_prefix else ""
-            mapping = self.quant_config.packed_modules_mapping
-            if proj_name in mapping:
-                sub_bits = []
-                for sub in mapping[proj_name]:
-                    sub_prefix = layer_prefix.replace(proj_name, sub)
-                    b = self.quant_config._get_layer_bits(sub_prefix)
-                    if b is not None:
-                        sub_bits.append(b)
-                if sub_bits and len(set(sub_bits)) > 1:
-                    logger.info(
-                        "EXL3: mixed K values %s in merged %s — "
-                        "dequant to FP16",
-                        sub_bits, proj_name,
-                    )
-                    had_incompatible = True
-
         if had_incompatible:
             self._create_weights_dequant(
                 layer, input_size_per_partition, output_partition_sizes,
@@ -782,24 +765,10 @@ class EXL3LinearMethod(LinearMethodBase):
             # RowParallel: output_partition_sizes are already full size
             full_output_partition_sizes = list(output_partition_sizes)
         else:
-            # ColumnParallel: output_partition_sizes are per-TP-rank.
-            # For QKV with GQA, K/V can be replicated when TP > num_kv_heads.
-            # In that case, the actual full K/V in the checkpoint is
-            # per_rank * (tp_size / num_kv_head_replicas), NOT per_rank * tp_size.
-            num_kv_head_replicas = getattr(layer, "num_kv_head_replicas", 1)
-            if num_kv_head_replicas > 1 and len(output_partition_sizes) == 3:
-                # QKV: index 0=Q (no replication), 1=K, 2=V (both replicated)
-                full_output_partition_sizes = [
-                    output_partition_sizes[0] * tp_size,
-                    output_partition_sizes[1] * tp_size
-                    // num_kv_head_replicas,
-                    output_partition_sizes[2] * tp_size
-                    // num_kv_head_replicas,
-                ]
-            else:
-                full_output_partition_sizes = [
-                    s * tp_size for s in output_partition_sizes
-                ]
+            # ColumnParallel: output_partition_sizes are per-TP-rank
+            full_output_partition_sizes = [
+                s * tp_size for s in output_partition_sizes
+            ]
         full_output_size = sum(full_output_partition_sizes)
 
         # Use full-size loader (no TP sharding for EXL3 params)
@@ -810,20 +779,7 @@ class EXL3LinearMethod(LinearMethodBase):
         # Full-size trellis
         tiles_k = input_size // 16
         tiles_n = full_output_size // 16
-
-        # For mixed-K layers, find the max bits across sub-projections
-        # so the trellis can hold all sub-projection data.
-        max_bits = self.bits
-        layer_prefix = getattr(layer, "prefix", "")
-        proj_name = layer_prefix.split(".")[-1] if layer_prefix else ""
-        mapping = self.quant_config.packed_modules_mapping
-        if proj_name in mapping:
-            for sub in mapping[proj_name]:
-                sub_prefix = layer_prefix.replace(proj_name, sub)
-                b = self.quant_config._get_layer_bits(sub_prefix)
-                if b is not None and b > max_bits:
-                    max_bits = b
-        words_per_tile = 16 * max_bits
+        words_per_tile = 16 * self.bits
 
         trellis = EXL3TrellisParameter(
             data=torch.zeros(
@@ -872,17 +828,6 @@ class EXL3LinearMethod(LinearMethodBase):
         layer.exl3_cb = self.quant_config.cb
         layer.exl3_output_partition_sizes = output_partition_sizes
         layer._exl3_dequant = True
-        # Per-projection bits for mixed-K merged layers
-        per_proj_bits = []
-        layer_prefix = getattr(layer, "prefix", "")
-        proj_name = layer_prefix.split(".")[-1] if layer_prefix else ""
-        mapping = self.quant_config.packed_modules_mapping
-        if proj_name in mapping:
-            for sub in mapping[proj_name]:
-                sub_prefix = layer_prefix.replace(proj_name, sub)
-                b = self.quant_config._get_layer_bits(sub_prefix)
-                per_proj_bits.append(b if b is not None else self.bits)
-        layer._exl3_per_proj_bits = per_proj_bits if per_proj_bits else None
         layer._exl3_dequant_full_output_sizes = full_output_partition_sizes
         layer._exl3_dequant_input_size = input_size
         layer._exl3_dequant_tp_size = tp_size
@@ -1031,12 +976,6 @@ class EXL3LinearMethod(LinearMethodBase):
             proj_n = full_output_sizes[i]
             proj_tiles = proj_n // 16
             proj_trellis = trellis.narrow(1, tile_offset, proj_tiles)
-            # For mixed-K: trim trellis to actual words_per_tile for this proj
-            per_proj_bits = getattr(layer, '_exl3_per_proj_bits', None)
-            proj_bits = per_proj_bits[i] if per_proj_bits else bits
-            actual_wpt = 16 * proj_bits
-            if proj_trellis.shape[2] > actual_wpt:
-                proj_trellis = proj_trellis[:, :, :actual_wpt].contiguous()
             proj_trellis_i32 = proj_trellis.contiguous().view(torch.int32)
             proj_svh = svh[out_offset:out_offset + proj_n]
 
@@ -1058,7 +997,7 @@ class EXL3LinearMethod(LinearMethodBase):
 
                 # GEMM
                 proj_out = exl3_gemm(
-                    xh, proj_trellis, bits=proj_bits, cb=cb,
+                    xh, proj_trellis, bits=bits, cb=cb,
                     B_i32=proj_trellis_i32,
                 )
 
@@ -1077,20 +1016,9 @@ class EXL3LinearMethod(LinearMethodBase):
                 tp_start = tp_rank * k_per_tp
                 sharded_weight = full_weight[tp_start:tp_start + k_per_tp, :]
             else:
-                # ColumnParallel: TP-shard the output (N) dimension.
-                # For QKV with GQA, K/V are replicated across ranks when
-                # TP > num_kv_heads (e.g. TP=8 with 4 KV heads -> replicas=2,
-                # ranks 0+1 share KV head 0, ranks 2+3 share KV head 1, ...)
+                # ColumnParallel: TP-shard the output (N) dimension
                 n_per_tp = output_partition_sizes[i]
-                num_kv_head_replicas = getattr(
-                    layer, "num_kv_head_replicas", 1)
-                if (i > 0 and len(output_partition_sizes) == 3
-                        and num_kv_head_replicas > 1):
-                    # K (i=1) or V (i=2) sub-projection with replication
-                    shard_rank = tp_rank // num_kv_head_replicas
-                else:
-                    shard_rank = tp_rank
-                tp_start = shard_rank * n_per_tp
+                tp_start = tp_rank * n_per_tp
                 sharded_weight = full_weight[:, tp_start:tp_start + n_per_tp]
             fp16_columns.append(sharded_weight)
 
@@ -2214,7 +2142,10 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # shared_experts_input is unused (Qwen3.5 MoE has no shared experts;
+        # Qwen3-Next handles shared expert in the model module, not here).
         from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
             moe_align_block_size,
         )
