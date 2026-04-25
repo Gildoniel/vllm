@@ -130,7 +130,13 @@ class SiluAndMul(CustomOp):
     def __init__(self, *, compile_native: bool = True):
         super().__init__(compile_native=compile_native)
         if current_platform.is_cuda_alike() or current_platform.is_xpu():
-            self.op = torch.ops._C.silu_and_mul
+            # Older locally-built _C.abi3.so may not export `silu_and_mul`
+            # (e.g., March 2026 ROCm build vs current upstream). Fall back
+            # to the PyTorch-native implementation in that case.
+            if hasattr(torch.ops._C, "silu_and_mul"):
+                self.op = torch.ops._C.silu_and_mul
+            else:
+                self._forward_method = self.forward_native
         elif current_platform.is_cpu():
             self._forward_method = self.forward_native
 
