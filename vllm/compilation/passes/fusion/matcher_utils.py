@@ -26,15 +26,28 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.platforms import current_platform
 
-RMS_ADD_OP = torch.ops._C.fused_add_rms_norm.default
-ROTARY_OP = torch.ops._C.rotary_embedding.default
+# When the locally-built _C.abi3.so is older than upstream and missing
+# fusion-target ops (e.g. ROCm March 2026 build), guard the lookups so
+# the module imports cleanly. Compilation/fusion passes that need these
+# ops will skip themselves at fusion-time when the op is None.
+def _maybe_op(name: str):
+    op = getattr(torch.ops._C, name, None)
+    return op.default if op is not None else None
+
+
+RMS_ADD_OP = _maybe_op("fused_add_rms_norm")
+ROTARY_OP = _maybe_op("rotary_embedding")
 FLASHINFER_ROTARY_OP = torch.ops.vllm.flashinfer_rotary_embedding.default
 
-QUANT_OPS: dict[QuantKey, OpOverload] = {
-    kFp8StaticTensorSym: torch.ops._C.static_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTensorSym: torch.ops._C.dynamic_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTokenSym: torch.ops._C.dynamic_per_token_scaled_fp8_quant.default,  # noqa: E501
-}
+QUANT_OPS: dict[QuantKey, OpOverload] = {}
+for _key, _name in (
+    (kFp8StaticTensorSym, "static_scaled_fp8_quant"),
+    (kFp8DynamicTensorSym, "dynamic_scaled_fp8_quant"),
+    (kFp8DynamicTokenSym, "dynamic_per_token_scaled_fp8_quant"),
+):
+    _op = _maybe_op(_name)
+    if _op is not None:
+        QUANT_OPS[_key] = _op
 
 if current_platform.is_cuda() and hasattr(torch.ops._C, "scaled_fp4_quant"):
     QUANT_OPS[kNvfp4Dynamic] = torch.ops._C.scaled_fp4_quant.out  # noqa: E501
@@ -43,7 +56,7 @@ if current_platform.is_cuda():
     QUANT_OPS[kFp8Dynamic128Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
     QUANT_OPS[kFp8Dynamic64Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
 
-SILU_MUL_OP = torch.ops._C.silu_and_mul.default
+SILU_MUL_OP = _maybe_op("silu_and_mul")
 
 
 class MatcherCustomOp(ABC):

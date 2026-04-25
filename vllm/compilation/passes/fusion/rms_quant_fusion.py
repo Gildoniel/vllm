@@ -70,13 +70,23 @@ def empty_i64(*args: Any, **kwargs: Any) -> torch.Tensor:
     return torch.empty(*args, **kwargs, dtype=torch.int64, device="cuda")
 
 
-RMS_ADD_OP = torch.ops._C.fused_add_rms_norm.default
+# Older _C.abi3.so may not export these — guard so module imports.
+def _maybe_op(name: str):
+    op = getattr(torch.ops._C, name, None)
+    return op.default if op is not None else None
 
-QUANT_OPS: dict[QuantKey, OpOverload] = {
-    kFp8StaticTensorSym: torch.ops._C.static_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTensorSym: torch.ops._C.dynamic_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTokenSym: torch.ops._C.dynamic_per_token_scaled_fp8_quant.default,  # noqa: E501
-}
+
+RMS_ADD_OP = _maybe_op("fused_add_rms_norm")
+
+QUANT_OPS: dict[QuantKey, OpOverload] = {}
+for _key, _name in (
+    (kFp8StaticTensorSym, "static_scaled_fp8_quant"),
+    (kFp8DynamicTensorSym, "dynamic_scaled_fp8_quant"),
+    (kFp8DynamicTokenSym, "dynamic_per_token_scaled_fp8_quant"),
+):
+    _op = _maybe_op(_name)
+    if _op is not None:
+        QUANT_OPS[_key] = _op
 if current_platform.is_cuda() and hasattr(torch.ops._C, "scaled_fp4_quant"):
     QUANT_OPS[kNvfp4Dynamic] = torch.ops._C.scaled_fp4_quant.out
 if current_platform.is_cuda():
@@ -101,32 +111,30 @@ class FusedRMSQuantKey(NamedTuple):
         )
 
 
-FUSED_OPS: dict[FusedRMSQuantKey, OpOverload] = {
-    FusedRMSQuantKey(
-        kFp8StaticTensorSym, False
-    ): torch.ops._C.rms_norm_static_fp8_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8StaticTensorSym, True
-    ): torch.ops._C.fused_add_rms_norm_static_fp8_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8DynamicTokenSym, False
-    ): torch.ops._C.rms_norm_dynamic_per_token_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8DynamicTokenSym, True
-    ): torch.ops._C.rms_norm_dynamic_per_token_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8Dynamic128Sym, False
-    ): torch.ops._C.rms_norm_per_block_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8Dynamic128Sym, True
-    ): torch.ops._C.rms_norm_per_block_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8Dynamic64Sym, False
-    ): torch.ops._C.rms_norm_per_block_quant.default,  # noqa: E501
-    FusedRMSQuantKey(
-        kFp8Dynamic64Sym, True
-    ): torch.ops._C.rms_norm_per_block_quant.default,  # noqa: E501
-}
+_RMS_FUSED_PAIRS = [
+    (FusedRMSQuantKey(kFp8StaticTensorSym, False),
+     "rms_norm_static_fp8_quant"),
+    (FusedRMSQuantKey(kFp8StaticTensorSym, True),
+     "fused_add_rms_norm_static_fp8_quant"),
+    (FusedRMSQuantKey(kFp8DynamicTokenSym, False),
+     "rms_norm_dynamic_per_token_quant"),
+    (FusedRMSQuantKey(kFp8DynamicTokenSym, True),
+     "rms_norm_dynamic_per_token_quant"),
+    (FusedRMSQuantKey(kFp8Dynamic128Sym, False),
+     "rms_norm_per_block_quant"),
+    (FusedRMSQuantKey(kFp8Dynamic128Sym, True),
+     "rms_norm_per_block_quant"),
+]
+FUSED_OPS: dict[FusedRMSQuantKey, OpOverload] = {}
+for _k, _name in _RMS_FUSED_PAIRS:
+    _op = _maybe_op(_name)
+    if _op is not None:
+        FUSED_OPS[_k] = _op
+for _k in (FusedRMSQuantKey(kFp8Dynamic64Sym, False),
+           FusedRMSQuantKey(kFp8Dynamic64Sym, True)):
+    _op = _maybe_op("rms_norm_per_block_quant")
+    if _op is not None:
+        FUSED_OPS[_k] = _op
 
 
 class RMSNormQuantPattern:
