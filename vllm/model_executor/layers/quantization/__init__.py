@@ -33,6 +33,7 @@ QuantizationMethods = Literal[
     "mxfp4",
     "gpt_oss_mxfp4",
     "cpu_awq",
+    "exl3",
     "online",
     # Below are values of the OnlineQuantScheme enum, specified as strings to
     # avoid circular import issues. This is here to provide a shortcut where
@@ -125,6 +126,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .fp8 import Fp8Config
     from .fp_quant import FPQuantConfig
     from .gguf import GGUFConfig
+    from .exl3 import EXL3Config
     from .gptq import GPTQConfig
     from .gptq_marlin import GPTQMarlinConfig
     from .humming import HummingConfig
@@ -164,6 +166,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "mxfp4": Mxfp4Config,
         "gpt_oss_mxfp4": GptOssMxfp4Config,
         "cpu_awq": CPUAWQConfig,
+        "exl3": EXL3Config,
         "humming": HummingConfig,
         "online": OnlineQuantizationConfig,
     }
