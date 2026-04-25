@@ -135,14 +135,22 @@ _hip_moe_splitk_buf = {}
 
 
 def _get_hip_moe_splitk_buf(split_k, EM, N, device):
-    """Get or allocate cached C_partial buffer for HIP MoE split-K."""
-    key = (device, split_k, N)
+    """Get or allocate cached C_partial buffer for HIP MoE split-K.
+
+    Cache by (device, split_k, EM, N) so the returned tensor matches the
+    requested shape exactly. The HIP kernel asserts is_contiguous, and
+    slicing a buf that was sized for a larger EM produces a non-contiguous
+    view, so we must hand back exact-shape buffers. CUDA graph capture
+    sees a finite set of EM values per layer, so the cache stays bounded.
+    """
+    EM = max(EM, 1)
+    key = (device, split_k, EM, N)
     buf = _hip_moe_splitk_buf.get(key)
-    if buf is None or buf.shape[1] < EM:
-        _hip_moe_splitk_buf[key] = torch.empty(
-            (split_k, max(EM, 1), N),
+    if buf is None:
+        buf = torch.empty(
+            (split_k, EM, N),
             dtype=torch.float16, device=device)
-        buf = _hip_moe_splitk_buf[key]
+        _hip_moe_splitk_buf[key] = buf
     return buf
 
 
