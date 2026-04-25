@@ -502,6 +502,7 @@ class Qwen3_5ForCausalLMBase(
                     config.vocab_size,
                     config.hidden_size,
                     prefix=maybe_prefix(prefix, "lm_head"),
+                    quant_config=self.quant_config,
                 )
         else:
             self.lm_head = PPMissingLayer()
@@ -542,11 +543,30 @@ class Qwen3_5ForCausalLMBase(
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=["mtp."],
-        )
-        return loader.load_weights(weights)
+        # Skip mtp layers and EXL3 tensors on tied lm_head: when
+        # tie_word_embeddings=True the lm_head is the embed_tokens module, so
+        # quantized lm_head weights (trellis/suh/svh/mcg/mul1) have no target.
+        skip = ["mtp."]
+        if getattr(self.config, "tie_word_embeddings", False):
+            skip.extend(
+                [
+                    "lm_head.trellis",
+                    "lm_head.suh",
+                    "lm_head.svh",
+                    "lm_head.mcg",
+                    "lm_head.mul1",
+                ]
+            )
+
+        def _remap_vl_prefix(weights_iter):
+            """Remap VL model prefix (model.language_model.X) to CausalLM
+            prefix (model.X) so VL-quantized checkpoints load into CausalLM."""
+            for name, tensor in weights_iter:
+                name = name.replace("model.language_model.", "model.", 1)
+                yield name, tensor
+
+        loader = AutoWeightsLoader(self, skip_prefixes=skip)
+        return loader.load_weights(_remap_vl_prefix(weights))
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):

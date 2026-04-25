@@ -100,7 +100,14 @@ def freeze_gc_heap() -> None:
     during serving time.
     """
     # Ensure all static objects are pushed down to the oldest generation for
-    # freeze
+    # freeze.
+    # ROCm 7.2 workaround: skip gc.collect to avoid segfault from
+    # ROCR-Runtime intercept-queue bug walking HIP-allocated tensors.
+    # Proper fix: rocm-jax intercept-queue patch on libhsa-runtime64.so.
+    import os
+    if os.environ.get("VLLM_TARGET_DEVICE") == "rocm":
+        gc.freeze()
+        return
     gc.collect(0)
     gc.collect(1)
     gc.collect(2)
