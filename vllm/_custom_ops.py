@@ -411,17 +411,47 @@ def rotary_embedding(
 
 
 # layer norm ops
+# Older locally-built _C.abi3.so (March 2026 ROCm build) may be missing
+# rms_norm / fused_add_rms_norm exports. Detect at import time and fall
+# back to native PyTorch implementations where needed.
+_HAS_C_RMS_NORM = hasattr(torch.ops._C, "rms_norm")
+_HAS_C_FUSED_ADD_RMS_NORM = hasattr(torch.ops._C, "fused_add_rms_norm")
+
+
+def _native_rms_norm(
+    out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, epsilon: float
+) -> None:
+    var = input.float().pow(2).mean(-1, keepdim=True)
+    out.copy_((input.float() * (var + epsilon).rsqrt()).to(input.dtype) * weight)
+
+
+def _native_fused_add_rms_norm(
+    input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, epsilon: float
+) -> None:
+    residual.add_(input)
+    var = residual.float().pow(2).mean(-1, keepdim=True)
+    input.copy_(
+        (residual.float() * (var + epsilon).rsqrt()).to(input.dtype) * weight
+    )
+
+
 def rms_norm(
     out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, epsilon: float
 ) -> None:
-    torch.ops._C.rms_norm(out, input, weight, epsilon)
+    if _HAS_C_RMS_NORM:
+        torch.ops._C.rms_norm(out, input, weight, epsilon)
+    else:
+        _native_rms_norm(out, input, weight, epsilon)
 
 
 def fused_add_rms_norm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, epsilon: float
 ) -> None:
     # Note: this func is batch invariant
-    torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
+    if _HAS_C_FUSED_ADD_RMS_NORM:
+        torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
+    else:
+        _native_fused_add_rms_norm(input, residual, weight, epsilon)
 
 
 def fused_qk_norm_rope(
