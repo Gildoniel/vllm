@@ -132,8 +132,16 @@ def _shard_idx(shard_id):
 def _load_trellis(param: "EXL3TrellisParameter", loaded_weight: torch.Tensor,
                   shard_id, output_sizes: list[int]):
     """Load trellis weight, handling merged column and QKV cases."""
-    tp_size = param.tp_size
-    tp_rank = param.tp_rank
+    # Dequant path: param holds full-size weights, no TP slicing at load time.
+    # `update_param_tp_status` overrides param.tp_size back to the layer TP
+    # size after create_weights returns, so we use the sticky marker set by
+    # `_create_weights_dequant`.
+    if getattr(param, "_exl3_dequant_load", False):
+        tp_size = 1
+        tp_rank = 0
+    else:
+        tp_size = param.tp_size
+        tp_rank = param.tp_rank
 
     if shard_id is None:
         # Non-merged: detect sharding dimension from shapes.
@@ -243,8 +251,12 @@ def _load_suh(param: "EXL3SuhParameter", loaded_weight: torch.Tensor,
     if shard_id is None:
         # Non-merged: RowParallel layers have TP-sharded input, so suh
         # (input scale) must be narrowed to the local partition.
-        tp_size = param.tp_size
-        tp_rank = param.tp_rank
+        if getattr(param, "_exl3_dequant_load", False):
+            tp_size = 1
+            tp_rank = 0
+        else:
+            tp_size = param.tp_size
+            tp_rank = param.tp_rank
         if tp_size > 1 and loaded_weight.shape[0] != param.data.shape[-1]:
             per_tp = param.data.shape[-1]
             loaded_weight = loaded_weight.narrow(
@@ -289,8 +301,12 @@ def _load_suh(param: "EXL3SuhParameter", loaded_weight: torch.Tensor,
 def _load_svh(param: "EXL3ScaleParameter", loaded_weight: torch.Tensor,
               shard_id, output_sizes: list[int]):
     """Load svh (output scale), handling merged column and QKV cases."""
-    tp_size = param.tp_size
-    tp_rank = param.tp_rank
+    if getattr(param, "_exl3_dequant_load", False):
+        tp_size = 1
+        tp_rank = 0
+    else:
+        tp_size = param.tp_size
+        tp_rank = param.tp_rank
 
     if shard_id is None:
         # ColumnParallel: svh (output scale) is TP-sharded, narrow it.
@@ -788,9 +804,13 @@ class EXL3LinearMethod(LinearMethodBase):
             ),
             weight_loader=exl3_loader,
         )
-        # Override TP attributes so weight loader doesn't TP-shard
+        # Override TP attributes so weight loader doesn't TP-shard.
+        # NOTE: ColumnParallelLinear.update_param_tp_status() resets these
+        # to the layer TP size after create_weights returns, so we also set
+        # `_exl3_dequant_load = True` as a sticky marker the loader checks.
         trellis.tp_size = 1
         trellis.tp_rank = 0
+        trellis._exl3_dequant_load = True
 
         # Full-size suh
         if num_projections > 1:
@@ -808,6 +828,7 @@ class EXL3LinearMethod(LinearMethodBase):
             )
         suh.tp_size = 1
         suh.tp_rank = 0
+        suh._exl3_dequant_load = True
 
         # Full-size svh
         svh = EXL3ScaleParameter(
@@ -816,6 +837,7 @@ class EXL3LinearMethod(LinearMethodBase):
         )
         svh.tp_size = 1
         svh.tp_rank = 0
+        svh._exl3_dequant_load = True
 
         layer.register_parameter("trellis", trellis)
         layer.register_parameter("suh", suh)
