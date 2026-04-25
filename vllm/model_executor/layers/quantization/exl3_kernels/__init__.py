@@ -584,6 +584,10 @@ def _exl3_fused_moe_gemm_hip(
         C_partial = C_partial[:split_k, :EM_max, :N]
         C_partial.zero_()
     else:
+        # split_k=1 path: kernel writes directly to C, but skips invalid /
+        # remote-EP m_blocks via early-return without zeroing — leaving stale
+        # data from the cached output buffer. Zero C explicitly here.
+        C.zero_()
         C_partial = torch.empty(1, 1, 1, dtype=torch.float16, device=A.device)
 
     _hip_ext.exl3_fused_moe_gemm(
