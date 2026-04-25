@@ -860,7 +860,22 @@ class LayerName(OpaqueBase):  # type: ignore[misc]
 if HAS_OPAQUE_TYPE:
     from torch._library.opaque_object import register_opaque_type
 
-    register_opaque_type(LayerName, typ="value", hoist=True)
+    # `members={"value": MemberType.INLINED}` lets dynamo read LayerName.value
+    # while tracing custom ops (e.g. moe_forward_shared) — without it
+    # inductor's fake-tensor pass calls .stride on the OpaqueObject and
+    # raises AttributeError("Tried to call __getattr__ with attr 'stride' on
+    # a FakeScriptObject"). MemberType is only available in torch 2.12+; on
+    # older torch we fall back to the bare hoist=True registration.
+    try:
+        from torch._library.opaque_object import MemberType  # type: ignore
+        register_opaque_type(
+            LayerName,
+            typ="value",
+            hoist=True,
+            members={"value": MemberType.INLINED},
+        )
+    except ImportError:
+        register_opaque_type(LayerName, typ="value", hoist=True)
 
 # On torch >= 2.11 (with VLLM_USE_LAYERNAME enabled), custom op
 # layer_name parameters use LayerName; otherwise they remain plain str.
