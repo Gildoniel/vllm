@@ -233,6 +233,22 @@ def _load_trellis(param: "EXL3TrellisParameter", loaded_weight: torch.Tensor,
     loaded_weight = loaded_weight.narrow(1, shard_rank * tile_size,
                                          tile_size)
     param_data = param.data.narrow(1, tile_offset, tile_size)
+    # Variable per-shard bits: loaded inner-dim may be SMALLER than param
+    # inner-dim (allocated with max-bits). Pad-load into the leading region.
+    loaded_inner = loaded_weight.shape[-1]
+    param_inner = param_data.shape[-1]
+    if loaded_inner != param_inner:
+        assert loaded_inner < param_inner, (
+            f"Trellis inner-dim larger than allocated: "
+            f"param_slice={param_data.shape}, loaded={loaded_weight.shape}, "
+            f"shard_id={shard_id}"
+        )
+        assert param_data.shape[:-1] == loaded_weight.shape[:-1], (
+            f"Trellis non-inner shape mismatch: param_slice={param_data.shape}, "
+            f"loaded={loaded_weight.shape}, shard_id={shard_id}"
+        )
+        param_data[..., :loaded_inner].copy_(loaded_weight)
+        return
     assert param_data.shape == loaded_weight.shape, (
         f"Trellis shape mismatch: param_slice={param_data.shape}, "
         f"loaded={loaded_weight.shape}, shard_id={shard_id}"
@@ -571,6 +587,50 @@ class EXL3Config(QuantizationConfig):
                 return self.head_bits
             return self.weight_bits
 
+    def _lookup_bits_for_unfused(self, unfused_prefix: str) -> int | None:
+        """Lookup bits for a single, unfused projection prefix.
+
+        Used by `_get_per_shard_bits_for_merged` to resolve per-shard bits
+        without re-triggering packed-module fallback.
+        """
+        if unfused_prefix in self._layer_bits:
+            return self._layer_bits[unfused_prefix]
+        stripped = unfused_prefix.removeprefix("model.")
+        if stripped in self._layer_bits:
+            return self._layer_bits[stripped]
+        norm = self._normalize_prefix(unfused_prefix)
+        if norm in self._layer_bits_normalized:
+            return self._layer_bits_normalized[norm]
+        return None
+
+    def _get_per_shard_bits_for_merged(self, prefix: str) -> list[int] | None:
+        """For merged projections (qkv_proj, gate_up_proj), return list of
+        per-shard bits in shard order. Returns None when not merged, when
+        any shard can't be resolved, or when all shards have identical bits
+        (in which case the regular `_get_layer_bits` path is sufficient).
+
+        Handles the variable-bits-per-projection case in EXL3 quants where
+        the quantizer chose different bit rates for Q/K/V (or gate/up).
+        """
+        if not self._layer_bits:
+            return None
+        proj_name = prefix.split(".")[-1]
+        if proj_name not in self.packed_modules_mapping:
+            return None
+        shard_names = self.packed_modules_mapping[proj_name]
+        if len(shard_names) <= 1:
+            return None
+        bits_list = []
+        for shard in shard_names:
+            unfused = prefix.replace(proj_name, shard)
+            b = self._lookup_bits_for_unfused(unfused)
+            if b is None:
+                return None
+            bits_list.append(b)
+        if len(set(bits_list)) == 1:
+            return None  # uniform — caller can use _get_layer_bits as-is
+        return bits_list
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Union["LinearMethodBase", "QuantizeMethodBase"] | None:
@@ -587,7 +647,9 @@ class EXL3Config(QuantizationConfig):
         if isinstance(layer, LinearBase):
             bits = self._get_layer_bits(prefix)
             if bits is not None:
-                return EXL3LinearMethod(self, bits)
+                # Detect variable per-shard bits for merged QKV/gate_up
+                per_shard_bits = self._get_per_shard_bits_for_merged(prefix)
+                return EXL3LinearMethod(self, bits, per_shard_bits)
             return UnquantizedLinearMethod()
         if isinstance(layer, ParallelLMHead):
             # Return EXL3EmbeddingMethod for all ParallelLMHead instances.
@@ -611,11 +673,24 @@ class EXL3LinearMethod(LinearMethodBase):
     Each projection has its own suh (input Hadamard scale). For merged
     layers (QKV, gate_up), we store per-projection suh and run each
     sub-projection separately in apply().
+
+    When the quantizer chose different bit rates per shard of a merged
+    projection, `per_shard_bits` is a list of bits (one per shard); the
+    trellis is allocated with max-bits inner-dim and per-shard regions
+    are pad-loaded (smaller shards leave trailing zeros in the inner-dim).
+    The apply()/dequant paths pass the per-shard bits to the EXL3 kernel
+    so each shard reads only its own data.
     """
 
-    def __init__(self, quant_config: EXL3Config, bits: int):
+    def __init__(self, quant_config: EXL3Config, bits: int,
+                 per_shard_bits: list[int] | None = None):
         self.quant_config = quant_config
         self.bits = bits
+        self.per_shard_bits = per_shard_bits
+        if per_shard_bits and len(set(per_shard_bits)) > 1:
+            self.max_bits = max(per_shard_bits)
+        else:
+            self.max_bits = bits
 
     def create_weights(
         self,
@@ -682,9 +757,13 @@ class EXL3LinearMethod(LinearMethodBase):
         )
 
         # Trellis: 3D (tiles_k, tiles_n_total, words_per_tile)
+        # For variable per-shard bits, allocate using MAX bits inner-dim
+        # so smaller-bits shards can be pad-loaded (leading region filled,
+        # trailing zeros). The EXL3 kernel reads bits*16 words per tile,
+        # so per-shard bits determines what's actually consumed.
         tiles_k = input_size_per_partition // 16
         tiles_n = output_size_per_partition // 16
-        words_per_tile = 16 * self.bits
+        words_per_tile = 16 * self.max_bits
 
         trellis = EXL3TrellisParameter(
             data=torch.zeros(
@@ -727,6 +806,8 @@ class EXL3LinearMethod(LinearMethodBase):
         self._register_cb_dummy(layer, exl3_loader)
 
         layer.exl3_bits = self.bits
+        layer.exl3_max_bits = self.max_bits
+        layer.exl3_per_shard_bits = self.per_shard_bits
         layer.exl3_cb = self.quant_config.cb
         layer.exl3_output_partition_sizes = output_partition_sizes
         layer._exl3_dequant = False
@@ -792,10 +873,10 @@ class EXL3LinearMethod(LinearMethodBase):
             original_weight_loader, full_output_partition_sizes
         )
 
-        # Full-size trellis
+        # Full-size trellis — use max_bits for variable per-shard inner-dim
         tiles_k = input_size // 16
         tiles_n = full_output_size // 16
-        words_per_tile = 16 * self.bits
+        words_per_tile = 16 * self.max_bits
 
         trellis = EXL3TrellisParameter(
             data=torch.zeros(
@@ -847,6 +928,8 @@ class EXL3LinearMethod(LinearMethodBase):
         self._register_cb_dummy(layer, exl3_loader)
 
         layer.exl3_bits = self.bits
+        layer.exl3_max_bits = self.max_bits
+        layer.exl3_per_shard_bits = self.per_shard_bits
         layer.exl3_cb = self.quant_config.cb
         layer.exl3_output_partition_sizes = output_partition_sizes
         layer._exl3_dequant = True
@@ -889,48 +972,56 @@ class EXL3LinearMethod(LinearMethodBase):
         _dbg(f"EXL3.pwl: caches done")
 
         # Pre-compute batched weight groups for merged layers (QKV, gate_up).
-        # Groups sub-projections by matching N so they can be dispatched as
-        # a single multi-GEMM launch for better CU occupancy.
+        # Groups sub-projections by matching (N, bits) so they can be dispatched
+        # as a single multi-GEMM launch when their bits match; variable per-shard
+        # bits projections are forced to singletons with own bits+inner-dim slice.
         suh = layer.suh.data
         if suh.dim() == 2:
             output_partition_sizes = layer.exl3_output_partition_sizes
             trellis_i32 = layer.trellis_i32
             num_proj = suh.shape[0]
+            per_shard_bits = getattr(layer, 'exl3_per_shard_bits', None)
+            default_bits = layer.exl3_bits
 
-            # Build per-projection metadata
+            # Build per-projection metadata with per-shard bits and inner-dim
             proj_infos = []
             tile_offset = 0
             out_offset = 0
             for i in range(num_proj):
                 proj_size = output_partition_sizes[i]
                 proj_tiles = proj_size // 16
+                shard_bits = per_shard_bits[i] if per_shard_bits else default_bits
                 proj_infos.append({
                     'index': i,
                     'proj_size': proj_size,
                     'proj_tiles': proj_tiles,
                     'tile_offset': tile_offset,
                     'out_offset': out_offset,
+                    'bits': shard_bits,
+                    'words_i16': 16 * shard_bits,
+                    'words_i32': 8 * shard_bits,
                 })
                 tile_offset += proj_tiles
                 out_offset += proj_size
 
-            # Group by matching N (proj_tiles)
+            # Group by matching (N, bits) — shards with different bits never batch
             from collections import defaultdict
-            groups_by_tiles = defaultdict(list)
+            groups_by_key = defaultdict(list)
             for pi in proj_infos:
-                groups_by_tiles[pi['proj_tiles']].append(pi)
+                groups_by_key[(pi['proj_tiles'], pi['bits'])].append(pi)
 
             batched_groups = []
             singleton_groups = []
-            for proj_tiles, members in groups_by_tiles.items():
+            for (proj_tiles, group_bits), members in groups_by_key.items():
                 if len(members) >= 2:
-                    # Stack trellis slices: (n_batch, tiles_k, tiles_n, wpt)
+                    # Stack trellis slices (sliced to inner-dim of group_bits)
                     slices = []
                     indices = []
                     out_offsets = []
                     for m in members:
                         s = trellis_i32[:, m['tile_offset']:
-                                        m['tile_offset'] + m['proj_tiles'], :]
+                                        m['tile_offset'] + m['proj_tiles'],
+                                        :m['words_i32']]
                         slices.append(s.contiguous())
                         indices.append(m['index'])
                         out_offsets.append(m['out_offset'])
@@ -941,19 +1032,23 @@ class EXL3LinearMethod(LinearMethodBase):
                         'n_batch': len(members),
                         'proj_N': members[0]['proj_size'],
                         'out_offsets': out_offsets,
+                        'bits': group_bits,
                     })
                 else:
                     m = members[0]
                     s = trellis_i32[:, m['tile_offset']:
-                                    m['tile_offset'] + m['proj_tiles'], :]
+                                    m['tile_offset'] + m['proj_tiles'],
+                                    :m['words_i32']]
                     singleton_groups.append({
                         'index': m['index'],
                         'trellis_i32': s.contiguous(),
                         'trellis': layer.trellis.data[
                             :, m['tile_offset']:
-                            m['tile_offset'] + m['proj_tiles'], :],
+                            m['tile_offset'] + m['proj_tiles'],
+                            :m['words_i16']],
                         'out_offset': m['out_offset'],
                         'proj_N': m['proj_size'],
+                        'bits': m['bits'],
                     })
 
             layer.exl3_batched_groups = batched_groups
@@ -975,6 +1070,7 @@ class EXL3LinearMethod(LinearMethodBase):
         suh = layer.suh.data
         svh = layer.svh.data
         bits = layer.exl3_bits
+        per_shard_bits = getattr(layer, 'exl3_per_shard_bits', None)
         cb = getattr(layer, 'exl3_cb', 0)
         full_output_sizes = layer._exl3_dequant_full_output_sizes
         tp_size = layer._exl3_dequant_tp_size
@@ -997,7 +1093,13 @@ class EXL3LinearMethod(LinearMethodBase):
             proj_suh = suh[i] if suh.dim() == 2 else suh
             proj_n = full_output_sizes[i]
             proj_tiles = proj_n // 16
-            proj_trellis = trellis.narrow(1, tile_offset, proj_tiles)
+            # Variable per-shard bits: use this shard's bits for the kernel.
+            # The merged trellis allocates max-bits inner-dim; the kernel
+            # only reads `shard_bits * 16` words per tile (rest is zeros).
+            shard_bits = per_shard_bits[i] if per_shard_bits else bits
+            shard_words = 16 * shard_bits
+            proj_trellis = trellis.narrow(
+                1, tile_offset, proj_tiles).narrow(2, 0, shard_words)
             proj_trellis_i32 = proj_trellis.contiguous().view(torch.int32)
             proj_svh = svh[out_offset:out_offset + proj_n]
 
@@ -1019,7 +1121,7 @@ class EXL3LinearMethod(LinearMethodBase):
 
                 # GEMM
                 proj_out = exl3_gemm(
-                    xh, proj_trellis, bits=bits, cb=cb,
+                    xh, proj_trellis, bits=shard_bits, cb=cb,
                     B_i32=proj_trellis_i32,
                 )
 
@@ -1111,17 +1213,19 @@ class EXL3LinearMethod(LinearMethodBase):
             out_h = torch.empty((M, N_total), dtype=x_2d.dtype,
                                 device=x_2d.device)
 
+            per_shard_bits = getattr(layer, 'exl3_per_shard_bits', None)
             if (_USE_MULTI_GEMM
                     and hasattr(layer, 'exl3_batched_groups')):
-                # V10.5: group-by-N batched dispatch
-                # Singleton groups (unique N): sequential Had→GEMM→Had
+                # V10.5: group-by-(N,bits) batched dispatch
+                # Singleton groups (unique key): sequential Had→GEMM→Had
                 for sg in layer.exl3_singleton_groups:
                     i = sg['index']
+                    sg_bits = sg.get('bits', bits)
                     xh = torch.empty_like(x_2d)
                     had_r_128(x_2d, xh, suh[i], None, 1.0)
 
                     proj_out = exl3_gemm(
-                        xh, sg['trellis'], bits=bits, cb=cb,
+                        xh, sg['trellis'], bits=sg_bits, cb=cb,
                         B_i32=sg['trellis_i32'],
                     )
 
@@ -1131,9 +1235,10 @@ class EXL3LinearMethod(LinearMethodBase):
                         1, sg['out_offset'], sg['proj_N'])
                     had_r_128(proj_out, proj_out_h, None, proj_svh, 1.0)
 
-                # Batched groups (matching N): multi-GEMM
+                # Batched groups (matching N+bits): multi-GEMM
                 for bg in layer.exl3_batched_groups:
                     n_batch = bg['n_batch']
+                    bg_bits = bg.get('bits', bits)
 
                     # Input Hadamard per sub-projection
                     xh_batched = torch.empty(
@@ -1146,7 +1251,7 @@ class EXL3LinearMethod(LinearMethodBase):
                     # Single batched GEMM launch
                     out_batched = exl3_multi_gemm(
                         xh_batched, bg['B_stacked_i32'],
-                        n_batch, bits=bits, cb=cb,
+                        n_batch, bits=bg_bits, cb=cb,
                     )
 
                     # Output Hadamard per sub-projection
@@ -1166,17 +1271,20 @@ class EXL3LinearMethod(LinearMethodBase):
                     proj_suh = suh[i]
                     proj_size = output_partition_sizes[i]
                     proj_tiles = proj_size // 16
+                    shard_bits = per_shard_bits[i] if per_shard_bits else bits
+                    shard_words = 16 * shard_bits
 
                     xh = torch.empty_like(x_2d)
                     had_r_128(x_2d, xh, proj_suh, None, 1.0)
 
                     proj_trellis = trellis.narrow(
-                        1, tile_offset, proj_tiles)
+                        1, tile_offset, proj_tiles).narrow(
+                        2, 0, shard_words)
                     proj_trellis_i32 = proj_trellis.contiguous().view(
                         torch.int32)
 
                     proj_out = exl3_gemm(
-                        xh, proj_trellis, bits=bits, cb=cb,
+                        xh, proj_trellis, bits=shard_bits, cb=cb,
                         B_i32=proj_trellis_i32,
                     )
 
