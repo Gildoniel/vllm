@@ -129,6 +129,20 @@ def _shard_idx(shard_id):
     return shard_id
 
 
+def _record_sub_bits(param, proj_idx: int, bits: int):
+    """Record the ACTUAL bit width of a projection as observed in the
+    checkpoint (trellis inner-dim // 16). For fused GDN projections the
+    config-derived `exl3_per_shard_bits` has checkpoint-shard granularity
+    (e.g. [in_proj_qkv, in_proj_z] = 2 entries) while the layer has
+    per-projection granularity (q,k,v,z = 4) — the recorded values let
+    `process_weights_after_loading` build the correct per-projection list."""
+    d = getattr(param, "_exl3_sub_bits", None)
+    if d is None:
+        d = {}
+        param._exl3_sub_bits = d
+    d[proj_idx] = bits
+
+
 def _load_trellis(param: "EXL3TrellisParameter", loaded_weight: torch.Tensor,
                   shard_id, output_sizes: list[int]):
     """Load trellis weight, handling merged column and QKV cases."""
@@ -208,12 +222,31 @@ def _load_trellis(param: "EXL3TrellisParameter", loaded_weight: torch.Tensor,
             src_start = ckpt_off_tiles + tp_rank * sub_per_tp_tiles
             src = loaded_weight.narrow(1, src_start, sub_per_tp_tiles)
             dst = param.data.narrow(1, param_off_tiles, sub_per_tp_tiles)
-            assert dst.shape == src.shape, (
-                f"Trellis sub-shard mismatch sub={sub_idx}: "
-                f"param={dst.shape}, ckpt_slice={src.shape}, "
-                f"per_tp_sizes={per_tp_sizes}, output_sizes={output_sizes}, "
-                f"loaded={loaded_weight.shape}, tp={tp_size}")
-            dst.copy_(src)
+            # Variable per-shard bits (same handling as the single-shard
+            # path below): the fused param is allocated with max-bits, so a
+            # sub-shard stored at fewer bits has a smaller inner dim.
+            # Pad-load into the leading region.
+            src_inner = src.shape[-1]
+            dst_inner = dst.shape[-1]
+            _record_sub_bits(param, sub_idx, src_inner // 16)
+            if src_inner != dst_inner:
+                assert src_inner < dst_inner, (
+                    f"Trellis sub-shard inner-dim larger than allocated "
+                    f"sub={sub_idx}: param={dst.shape}, ckpt_slice={src.shape}, "
+                    f"loaded={loaded_weight.shape}, tp={tp_size}")
+                assert dst.shape[:-1] == src.shape[:-1], (
+                    f"Trellis sub-shard mismatch sub={sub_idx}: "
+                    f"param={dst.shape}, ckpt_slice={src.shape}, "
+                    f"per_tp_sizes={per_tp_sizes}, output_sizes={output_sizes}, "
+                    f"loaded={loaded_weight.shape}, tp={tp_size}")
+                dst[..., :src_inner].copy_(src)
+            else:
+                assert dst.shape == src.shape, (
+                    f"Trellis sub-shard mismatch sub={sub_idx}: "
+                    f"param={dst.shape}, ckpt_slice={src.shape}, "
+                    f"per_tp_sizes={per_tp_sizes}, output_sizes={output_sizes}, "
+                    f"loaded={loaded_weight.shape}, tp={tp_size}")
+                dst.copy_(src)
             param_off_tiles += sub_per_tp_tiles
             ckpt_off_tiles += sub_full_tiles
         return
@@ -233,6 +266,7 @@ def _load_trellis(param: "EXL3TrellisParameter", loaded_weight: torch.Tensor,
     loaded_weight = loaded_weight.narrow(1, shard_rank * tile_size,
                                          tile_size)
     param_data = param.data.narrow(1, tile_offset, tile_size)
+    _record_sub_bits(param, idx, loaded_weight.shape[-1] // 16)
     # Variable per-shard bits: loaded inner-dim may be SMALLER than param
     # inner-dim (allocated with max-bits). Pad-load into the leading region.
     loaded_inner = loaded_weight.shape[-1]
@@ -940,6 +974,24 @@ class EXL3LinearMethod(LinearMethodBase):
         layer._exl3_dequant_params_dtype = params_dtype
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Canonicalize per-shard bits to PER-PROJECTION granularity before
+        # anything reads them. The config-derived list follows
+        # packed_modules_mapping (checkpoint shards), which for fused GDN
+        # projections (in_proj_qkvz -> [in_proj_qkv, in_proj_z]) is shorter
+        # than the layer's projection count (q,k,v,z) and would index out of
+        # range. The loader recorded the actual bits per projection from the
+        # checkpoint tensor shapes — authoritative, so prefer them.
+        suh_data = layer.suh.data if hasattr(layer, 'suh') else None
+        sub_bits = getattr(layer.trellis, "_exl3_sub_bits", None) \
+            if hasattr(layer, 'trellis') else None
+        if (sub_bits and suh_data is not None and suh_data.dim() == 2):
+            num_proj = suh_data.shape[0]
+            if set(sub_bits.keys()) == set(range(num_proj)):
+                bits_list = [sub_bits[i] for i in range(num_proj)]
+                if (len(set(bits_list)) > 1
+                        or getattr(layer, 'exl3_per_shard_bits', None)):
+                    layer.exl3_per_shard_bits = bits_list
+
         if getattr(layer, '_exl3_dequant', False):
             _dbg(f"EXL3.pwl: dequant path")
             self._process_weights_dequant(layer)
