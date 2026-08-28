@@ -107,8 +107,13 @@ if _USE_HIP_MOE_GEMM:
                 _hip_ext is not None
                 and hasattr(_hip_ext, 'batched_dual_had_r_128')
             )
-    except (ImportError, RuntimeError):
-        pass
+    except Exception as _e:
+        # Log failure visibly (was silent — masked the ninja-missing bug for months)
+        import os, sys, logging
+        logging.getLogger(__name__).warning(
+            "[exl3_kernels] HIP ext load FAILED pid=%d: %s: %s",
+            os.getpid(), type(_e).__name__, _e,
+        )
 
 # v3 lock buffer cache: {(device, needed): tensor}
 _hip_v3_lock_buf = {}
