@@ -236,6 +236,52 @@ def convert_bin_to_safetensor_file(
             raise RuntimeError(f"The output tensors do not match for key {k}")
 
 
+def _exl3_supplement_tensor_storage(
+    hf_quant_config: dict[str, Any],
+    model_config: "ModelConfig",
+    load_config: "LoadConfig",
+) -> None:
+    """Supplement embedded EXL3 config with tensor_storage from the standalone
+    quantization_config.json file. Per-layer bit widths can be too large to
+    embed in config.json, so they live in a sibling file."""
+    model_name_or_path = model_config.model
+    if os.path.isdir(model_name_or_path):
+        hf_folder = model_name_or_path
+    else:
+        try:
+            hf_folder = (
+                maybe_download_from_modelscope(
+                    model_config.model,
+                    revision=model_config.revision,
+                    download_dir=load_config.download_dir,
+                    allow_patterns=["quantization_config.json"],
+                )
+                or model_config.model
+            )
+            if not os.path.isdir(hf_folder):
+                with get_lock(model_config.model, load_config.download_dir):
+                    hf_folder = hf_api().snapshot_download(
+                        model_config.model,
+                        revision=model_config.revision,
+                        allow_patterns="quantization_config.json",
+                        cache_dir=load_config.download_dir,
+                        local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                        tqdm_class=DisabledTqdm,
+                    )
+        except Exception:
+            return  # Best-effort: fall back to uniform bits
+
+    config_path = os.path.join(hf_folder, "quantization_config.json")
+    if not os.path.isfile(config_path):
+        return
+
+    with open(config_path) as f:
+        full_config = json.load(f)
+
+    if "tensor_storage" in full_config:
+        hf_quant_config["tensor_storage"] = full_config["tensor_storage"]
+
+
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
     model_config: ModelConfig, load_config: LoadConfig
@@ -284,6 +330,18 @@ def get_quant_config(
         ):
             pass  # fall through to file-based loading below
         else:
+            # EXL3 mixed-precision models keep per-layer bit widths in
+            # tensor_storage, which lives only in the standalone
+            # quantization_config.json (too large for config.json's embedded
+            # quantization_config). Supplement the embedded config when it is
+            # missing tensor_storage so per-layer bits resolve correctly.
+            if (
+                hf_quant_config.get("quant_method") == "exl3"
+                and "tensor_storage" not in hf_quant_config
+            ):
+                _exl3_supplement_tensor_storage(
+                    hf_quant_config, model_config, load_config
+                )
             return quant_cls.from_config(hf_quant_config)
 
     # if hf_quant_config is None, we will try to get config from

@@ -436,7 +436,20 @@ class Qwen3_5ForCausalLMBase(
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
+        # When tie_word_embeddings=True the lm_head is the embed_tokens module,
+        # so EXL3-quantized lm_head weights (trellis/suh/svh/mcg/mul1) have no
+        # target and must be skipped. (VL-prefix remap and mtp skip are handled
+        # by hf_to_vllm_mapper.)
+        skip_prefixes = None
+        if getattr(self.config, "tie_word_embeddings", False):
+            skip_prefixes = [
+                "lm_head.trellis",
+                "lm_head.suh",
+                "lm_head.svh",
+                "lm_head.mcg",
+                "lm_head.mul1",
+            ]
+        loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mrope_input_positions(

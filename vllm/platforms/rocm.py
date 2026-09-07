@@ -212,7 +212,10 @@ def _get_gcn_arch() -> str:
 # Resolve once at module load. Uses amdsmi (no CUDA init) so Ray workers
 # can still set CUDA_VISIBLE_DEVICES after import.
 # These are plain Python bools — fully torch.compile/Dynamo safe.
-_GCN_ARCH = _get_gcn_arch()
+# Honor VLLM_GCN_ARCH env var first: lets subprocesses without GPU access
+# (e.g. registry model-class inspection) skip amdsmi/torch.cuda which would
+# either return a placeholder ("gfx0") or init CUDA prematurely.
+_GCN_ARCH = os.environ.get("VLLM_GCN_ARCH", "") or _get_gcn_arch()
 
 _ON_GFX1X = any(arch in _GCN_ARCH for arch in ["gfx11", "gfx12"])
 _ON_GFX11 = "gfx11" in _GCN_ARCH
@@ -534,6 +537,7 @@ class RocmPlatform(Platform):
         "fp8_per_channel",
         "online",
         "gpt_oss_mxfp4",
+        "exl3",
     ]
 
     @classmethod
