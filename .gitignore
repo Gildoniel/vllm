@@ -254,3 +254,13 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# Lokale Build-Artefakte (vllm-next port)
+.cargo_home/
+.triton_kernels_seed/
+.deps/
+.build.log
+.deps_install.log
+.torch_constraints.txt
+.rc4_dep_bumps.txt
+.fetch_rc4.log

@@ -438,18 +438,21 @@ class Qwen3_5ForCausalLMBase(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # When tie_word_embeddings=True the lm_head is the embed_tokens module,
         # so EXL3-quantized lm_head weights (trellis/suh/svh/mcg/mul1) have no
-        # target and must be skipped. (VL-prefix remap and mtp skip are handled
-        # by hf_to_vllm_mapper.)
-        skip_prefixes = None
+        # target and are unexpected. (VL-prefix remap and mtp skip are handled
+        # by hf_to_vllm_mapper.) rc4's AutoWeightsLoader takes
+        # ignore_unexpected_prefixes, not skip_prefixes.
+        ignore_unexpected_prefixes = None
         if getattr(self.config, "tie_word_embeddings", False):
-            skip_prefixes = [
+            ignore_unexpected_prefixes = [
                 "lm_head.trellis",
                 "lm_head.suh",
                 "lm_head.svh",
                 "lm_head.mcg",
                 "lm_head.mul1",
             ]
-        loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
+        loader = AutoWeightsLoader(
+            self, ignore_unexpected_prefixes=ignore_unexpected_prefixes
+        )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mrope_input_positions(

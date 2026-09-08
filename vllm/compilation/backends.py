@@ -597,7 +597,16 @@ def split_graph(
     # the semantics of the graph will change when we
     # have mutations in the graph
     with _use_lazy_graph_module(True):
-        has_tuple_return = is_torch_equal_or_newer("2.12.0.dev")
+        # The `tuple_return` kwarg landed inside the 2.12.0.dev cycle, so the
+        # version check is unreliable across nightlies (our local torch
+        # 2.12.0.dev ships an older split_module signature). Probe the actual
+        # signature to stay robust.
+        import inspect as _inspect
+
+        _split_params = _inspect.signature(
+            torch.fx.passes.split_module.split_module
+        ).parameters
+        has_tuple_return = "tuple_return" in _split_params
         tuple_return_kwarg = {"tuple_return": True} if has_tuple_return else {}
         split_gm = torch.fx.passes.split_module.split_module(
             graph,

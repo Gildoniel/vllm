@@ -1539,6 +1539,13 @@ def _run() -> None:
     with open(output_file, "wb") as f:
         f.write(pickle.dumps(result))
 
+    # ROCm 7.2 workaround: skip Python shutdown GC to avoid segfault from
+    # ROCR-Runtime intercept-queue bug walking HIP-allocated tensors.
+    import os as _os
+
+    if _os.environ.get("VLLM_TARGET_DEVICE") == "rocm":
+        _os._exit(0)
+
 
 if __name__ == "__main__":
     _run()

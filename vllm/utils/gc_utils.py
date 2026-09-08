@@ -99,6 +99,13 @@ def freeze_gc_heap() -> None:
     after server init / warmup, to reduce GC overhead from static objects
     during serving time.
     """
+    # ROCm 7.2 workaround: skip gc.collect to avoid segfault from ROCR-Runtime
+    # intercept-queue bug walking HIP-allocated tensors. Just freeze in place.
+    import os
+
+    if os.environ.get("VLLM_TARGET_DEVICE") == "rocm":
+        gc.freeze()
+        return
     # Ensure all static objects are pushed down to the oldest generation for
     # freeze
     gc.collect(0)

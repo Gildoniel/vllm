@@ -1,0 +1,11 @@
+# rc4-Runtime-Dep-Bumps im rocm_env_next (kopiert vom älteren Prod-venv).
+# Alle via `pip install --no-deps` installiert — torch 2.12+rocm NIE angefasst.
+# Nötig, damit `import vllm` + get_quantization_config('exl3') + qwen4_exp laufen.
+# Auf .102 identisch anwenden.
+transformers>=5.10.4        # war 5.3.0 -> 5.16.1 (ALLOWED_LAYER_TYPES)
+tokenizers>=0.23.1,<0.24.0  # war 0.22.2 -> 0.23.2 (transformers 5.16 Pin)
+safetensors>=0.8.0          # war 0.7.0  -> 0.8.0  (transformers 5.16 Pin)
+compressed-tensors==0.17.0  # war 0.13.0 -> 0.17.0 (rc4-Pin; compressors.pack_quantized)
+setuptools-rust>=1.9.0      # Build-Dep (fehlte); rust-Frontend
+openai>=2.0.0 (-> 3.8.0)    # NamespaceTool in openai.types.responses (API-Server-Start)
+httpx2>=2.12.0              # neue Dep von openai 3.x (--no-deps)

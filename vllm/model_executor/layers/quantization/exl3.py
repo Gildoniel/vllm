@@ -668,12 +668,14 @@ class EXL3Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Union["LinearMethodBase", "QuantizeMethodBase"] | None:
-        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        from vllm.model_executor.layers.fused_moe.routed_experts import (
+            RoutedExperts,
+        )
         from vllm.model_executor.layers.vocab_parallel_embedding import (
             ParallelLMHead,
         )
 
-        if isinstance(layer, FusedMoE):
+        if isinstance(layer, RoutedExperts):
             bits = self._get_moe_layer_bits(prefix)
             if bits is not None:
                 return EXL3FusedMoEMethod(self, bits, layer.moe_config)
