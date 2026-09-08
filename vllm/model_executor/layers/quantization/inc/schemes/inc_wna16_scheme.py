@@ -179,10 +179,13 @@ def _resolve_gptq_moe(layer: "torch.nn.Module", layer_config: "INCLayerConfig"):
     # (Marlin on CUDA, XPUExpertsWNA16 on XPU). Gate only on the layer-shape
     # check like compressed-tensors does; the capability-based
     # check_marlin_supported is skipped so the XPU path is reachable.
-    use_marlin = (layer_config.bits, layer_config.sym) in {
-        (4, True),
-        (8, True),
-    } and check_moe_marlin_supports_layer(layer, layer_config.group_size)
+    # Marlin is CUDA-only; on ROCm the shape check alone would still select
+    # it. Route ROCm to the Triton MoeWNA16 fallback below instead.
+    use_marlin = (
+        (layer_config.bits, layer_config.sym) in {(4, True), (8, True)}
+        and not current_platform.is_rocm()
+        and check_moe_marlin_supports_layer(layer, layer_config.group_size)
+    )
 
     if use_marlin:
         return AutoGPTQMoEMethod(

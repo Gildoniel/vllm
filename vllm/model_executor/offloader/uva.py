@@ -121,6 +121,15 @@ class UVAOffloader(BaseOffloader):
             self.cpu_offload_bytes += p.data.numel() * p.data.element_size()
             offloaded_parameters = True
 
+        if offloaded_parameters:
+            # Release the freed device storage now, while its segment is
+            # still fully free. Layers built afterwards would otherwise
+            # allocate into it and leave a large, unreleasable remnant
+            # (caching-allocator fragmentation) that the memory profiler
+            # counts as consumed and the KV-cache sizing never gets back
+            # (~7.5 GiB remnant for a 24 GiB offloaded ngram table).
+            torch.accelerator.empty_cache()
+
         if offloaded_parameters and not self.uva_offloading:
             original_forward = module.forward
 
