@@ -373,7 +373,14 @@ def _load_svh(param: "EXL3ScaleParameter", loaded_weight: torch.Tensor,
             if load_size < per_tp:
                 param.data[:load_size].copy_(loaded_weight)
                 return
-        assert param.data.shape == loaded_weight.shape
+        assert param.data.shape == loaded_weight.shape, (
+            f"svh shape mismatch (shard_id=None): "
+            f"param={tuple(param.data.shape)}, "
+            f"loaded={tuple(loaded_weight.shape)}, "
+            f"tp_size={tp_size}, tp_rank={tp_rank}, "
+            f"output_sizes={output_sizes}, "
+            f"prefix={getattr(param, 'prefix', '?')}"
+        )
         param.data.copy_(loaded_weight)
         return
 
@@ -836,6 +843,11 @@ class EXL3LinearMethod(LinearMethodBase):
         layer.register_parameter("trellis", trellis)
         layer.register_parameter("suh", suh)
         layer.register_parameter("svh", svh)
+        # Stamp the owning module prefix for diagnostics (misroute tracing)
+        _dbg_prefix = getattr(layer, "prefix", "?")
+        svh.prefix = _dbg_prefix
+        suh.prefix = _dbg_prefix
+        trellis.prefix = _dbg_prefix
 
         # Register codebook marker dummy param (mcg/mul1) so vLLM's
         # weight loader doesn't crash on the checkpoint tensor.
@@ -892,10 +904,19 @@ class EXL3LinearMethod(LinearMethodBase):
         # Detect sharding type:
         # ColumnParallel: output is TP-sharded, input is full
         # RowParallel: input is TP-sharded, output is full
+        # Replicated (e.g. ReplicatedLinear like the QSA index_qk_proj):
+        #   neither is sharded — output_partition_sizes are ALREADY full.
+        # `is_row_parallel` alone mis-classifies Replicated as ColumnParallel
+        # (input not sharded) and scales output by TP, over-allocating svh
+        # (e.g. index_qk_proj: 640 * TP4 = 2560 vs checkpoint 640).
+        # Use `output_size` (the full logical output vLLM passes) as ground
+        # truth: when per-rank output already equals it, the output is not
+        # TP-sharded (RowParallel or Replicated) and must not be scaled.
         is_row_parallel = (input_size_per_partition != input_size)
+        per_rank_output = sum(output_partition_sizes)
+        output_already_full = is_row_parallel or per_rank_output == output_size
 
-        if is_row_parallel:
-            # RowParallel: output_partition_sizes are already full size
+        if output_already_full:
             full_output_partition_sizes = list(output_partition_sizes)
         else:
             # ColumnParallel: output_partition_sizes are per-TP-rank
@@ -973,6 +994,9 @@ class EXL3LinearMethod(LinearMethodBase):
         layer._exl3_dequant_input_size = input_size
         layer._exl3_dequant_tp_size = tp_size
         layer._exl3_dequant_is_row_parallel = is_row_parallel
+        # Replicated (neither dim sharded): post-load must keep the full
+        # output on every rank instead of N-sharding it (see _dequant_layer).
+        layer._exl3_dequant_output_already_full = output_already_full
         layer._exl3_dequant_params_dtype = params_dtype
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -1193,6 +1217,12 @@ class EXL3LinearMethod(LinearMethodBase):
                 k_per_tp = K // tp_size
                 tp_start = tp_rank * k_per_tp
                 sharded_weight = full_weight[tp_start:tp_start + k_per_tp, :]
+            elif getattr(layer, '_exl3_dequant_output_already_full', False):
+                # Replicated (e.g. QSA index_qk_proj): output is full on
+                # every rank. N-sharding here handed ranks > 0 an empty
+                # slice past the weight (tp_rank * N), producing width-0
+                # outputs downstream.
+                sharded_weight = full_weight
             else:
                 # ColumnParallel: TP-shard the output (N) dimension
                 n_per_tp = output_partition_sizes[i]

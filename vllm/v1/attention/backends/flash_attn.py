@@ -51,6 +51,12 @@ if is_flash_attn_varlen_func_available():
         get_scheduler_metadata,
         reshape_and_cache_flash,
     )
+else:
+    # reshape_and_cache_flash is vLLM's own _C cache op, not a flash-attn
+    # function. Subclasses that reuse do_kv_cache_update without ever calling
+    # flash_attn (e.g. qwen4_exp QSA on ROCm, which attends via its own Triton
+    # kernel) still need it bound when flash_attn is unavailable.
+    from vllm._custom_ops import reshape_and_cache_flash
 import vllm.envs as envs
 from vllm.config import (
     VllmConfig,

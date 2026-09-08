@@ -257,7 +257,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
         hc_config = HyperConnectionConfig(
             hc_count=config.hc_count,
             hidden_size=config.hidden_size,
-            params_dtype=torch.bfloat16,
+            # Follow the model dtype: EXL3 serves fp16, a hard-coded bf16
+            # here makes the unquantized HC gemms mix Half x BFloat16.
+            params_dtype=vllm_config.model_config.dtype,
             hc_lowrank=config.hc_lowrank,
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
@@ -433,7 +435,7 @@ class Qwen4ExpModel(nn.Module):
             hc_config = HyperConnectionConfig(
                 hc_count=config.hc_count,
                 hidden_size=config.hidden_size,
-                params_dtype=torch.bfloat16,
+                params_dtype=vllm_config.model_config.dtype,
                 hc_lowrank=config.hc_lowrank,
                 rms_norm_eps=config.rms_norm_eps,
                 hc_per_branch_norm=True,
@@ -645,6 +647,7 @@ class Qwen4ExpForCausalLM(
             config.vocab_size,
             config.hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
+            quant_config=self.quant_config,
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
