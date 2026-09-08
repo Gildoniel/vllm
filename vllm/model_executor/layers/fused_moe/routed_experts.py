@@ -922,6 +922,22 @@ class RoutedExperts(PluggableLayer):
                         f"Layer {self.layer_name} has no parameter {param_name!r} "
                         f"for checkpoint weight {qual_name!r}"
                     )
+                if getattr(param, "exl3_per_expert_3d", False):
+                    # EXL3 trellis weights are inherently 3D PER EXPERT, so the
+                    # `dim()==3 => fused-all-experts` heuristic misfires and would
+                    # unbind their leading tile dimension. Deliver the whole
+                    # per-expert tensor with the mapping's real expert_id; the
+                    # exl3 loader TP-shards internally.
+                    if param.weight_loader(
+                        param=param,
+                        loaded_weight=loaded_weight,
+                        weight_name=weight_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                        return_success=True,
+                    ):
+                        yield param_name
+                    continue
                 if is_fused:
                     quant_method = getattr(param, "quant_method", None)
                     # Block scales share the weight's two-dimensional layout.

@@ -1708,7 +1708,7 @@ def _make_exl3_moe_weight_loader(
         if expert_map is not None:
             local_id = expert_map[expert_id].item()
             if local_id == -1:
-                return  # Expert not local to this rank
+                return False  # Expert not local to this rank
             expert_id = local_id
 
         # Determine TP slice for each weight type.
@@ -1734,6 +1734,7 @@ def _make_exl3_moe_weight_loader(
                 param, loaded_weight, expert_id, shard_id,
                 intermediate_size_per_partition, tp_size, tp_rank,
             )
+        return True
 
     return _loader
 
@@ -1893,8 +1894,17 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        tp_size = getattr(layer, "tp_size", 1)
-        tp_rank = getattr(layer, "tp_rank", 0)
+        # rc4's RoutedExperts has no .tp_size/.tp_rank attrs — TP lives in
+        # moe_config.moe_parallel_config (proxied by moe_config.tp_size/tp_rank).
+        # getattr(layer, "tp_size", 1) silently returned 1/0 and mis-sized the
+        # per-TP expert params.
+        moe_cfg = getattr(layer, "moe_config", None)
+        if moe_cfg is not None:
+            tp_size = moe_cfg.tp_size
+            tp_rank = moe_cfg.tp_rank
+        else:
+            tp_size = getattr(layer, "tp_size", 1)
+            tp_rank = getattr(layer, "tp_rank", 0)
 
         # Validate Had-128 compatibility
         if (intermediate_size_per_partition % 128 != 0
@@ -1933,6 +1943,10 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
                 "w13_trellis", hidden_size,
                 intermediate_size_per_partition, tp_size, tp_rank, layer,
             ),
+            # Marker: trellis weights are inherently 3D PER EXPERT; rc4's
+            # RoutedExperts.load_weights must NOT treat them as fused-all-
+            # experts tensors and unbind their leading (tile) dimension.
+            "exl3_per_expert_3d": True,
         })
 
         w13_suh = torch.nn.Parameter(
@@ -1979,6 +1993,7 @@ class EXL3FusedMoEMethod(FusedMoEMethodBase):
                 "w2_trellis", hidden_size,
                 intermediate_size_per_partition, tp_size, tp_rank, layer,
             ),
+            "exl3_per_expert_3d": True,
         })
 
         w2_suh = torch.nn.Parameter(
