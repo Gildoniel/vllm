@@ -118,6 +118,16 @@ def _make_draft_vllm_config(
         raise ValueError("speculative_config.draft_model_config must be set")
 
     draft_quant_config = get_draft_quant_config(vllm_config)
+    if draft_quant_config is None and vllm_config.quant_config is not None:
+        # In-checkpoint MTP (mtp.* lives in the target's quantized checkpoint,
+        # e.g. EXL3): the draft model config carries no `quantization`, so
+        # the draft would be built unquantized and could not load the
+        # quantized mtp.* tensors. Fall back to a copy of the target's quant
+        # config (a copy so configure_quant_config below cannot mutate the
+        # target's object).
+        from copy import copy as _copy
+
+        draft_quant_config = _copy(vllm_config.quant_config)
 
     # inject packed and ignored modules to the quantization config of draft model
     if draft_quant_config is not None:
@@ -174,7 +184,15 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
 
-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, self.hidden_size)
+        # The draft loads the checkpoint's embed_tokens.* itself (see the
+        # weight mapper); with a quantized checkpoint (EXL3) those tensors
+        # only fit a quantized embedding, so pass the quant config through.
+        self.embed_tokens = VocabParallelEmbedding(
+            self.vocab_size,
+            self.hidden_size,
+            quant_config=vllm_config.quant_config,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
+        )
         draft_vllm_config = _make_draft_vllm_config(
             vllm_config,
             self.mtp_start_layer_idx,
@@ -404,6 +422,9 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
+                    # EXL3 checkpoints carry quantized lm_head.* (+ mcg/mul1
+                    # markers); an unquantized head cannot load them.
+                    quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:

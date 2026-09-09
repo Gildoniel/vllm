@@ -328,7 +328,14 @@ class CudaGraphManager:
                 because attention backends may mutate or lazily initialize
                 metadata during warmup.
         """
-        with graph_capture(device=self.device):
+        # Reuse a caller-provided capture context (same side stream, one
+        # capture window) when the runner captures target + speculator
+        # together; separate windows/streams made the draft's TP collectives
+        # trip the RCCL watchdog (hipErrorCapturedEvent) on ROCm.
+        with graph_capture(
+            device=self.device,
+            graph_capture_context=getattr(self, "capture_context", None),
+        ):
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
@@ -384,7 +391,13 @@ class CudaGraphManager:
                             torch.accelerator.synchronize()
                             free_before = torch.accelerator.get_memory_info()[0]
                         with torch.cuda.graph(
-                            graph, self.pool, stream=current_stream()
+                            graph,
+                            self.pool,
+                            stream=current_stream(),
+                            # See compilation/cuda_graph.py: allow other
+                            # threads (RCCL watchdog) to touch CUDA during
+                            # capture instead of aborting the process.
+                            capture_error_mode="thread_local",
                         ):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid

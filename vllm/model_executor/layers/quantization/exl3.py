@@ -490,12 +490,17 @@ class EXL3Config(QuantizationConfig):
         head_bits: int,
         tensor_storage: dict[str, Any],
         cb: int = 0,
+        mtp_bits: int | None = None,
     ) -> None:
         super().__init__()
         self.weight_bits = weight_bits
         self.head_bits = head_bits
         self.tensor_storage = tensor_storage
         self.cb = cb
+        # MTP (multi-token-predictor) layers are quantized at a single
+        # bitrate given by the top-level `mtp_bits` field; tensor_storage
+        # carries no per-tensor entries for `mtp.*` (turboderp exl3 ≥ 1.4).
+        self.mtp_bits = mtp_bits
 
         # Build lookup: prefix -> bits_per_weight (only for EXL3 layers)
         self._layer_bits: dict[str, int] = {}
@@ -514,6 +519,14 @@ class EXL3Config(QuantizationConfig):
         for prefix, bits in self._layer_bits.items():
             norm = self._normalize_prefix(prefix)
             self._layer_bits_normalized[norm] = bits
+
+        # MTP layer indices present in tensor_storage (checkpoint naming
+        # mtp.layers.<k>); the draft model names them mtp.layers.<start + k>.
+        self._mtp_layer_indices: list[int] = sorted({
+            int(key.split(".")[2])
+            for key in self._layer_bits
+            if key.startswith("mtp.layers.") and key.split(".")[2].isdigit()
+        })
 
     def __repr__(self) -> str:
         return (
@@ -539,6 +552,8 @@ class EXL3Config(QuantizationConfig):
     def from_config(cls, config: dict[str, Any]) -> "EXL3Config":
         weight_bits = int(config.get("bits", 4))
         head_bits = int(config.get("head_bits", 6))
+        mtp_bits_raw = config.get("mtp_bits")
+        mtp_bits = int(mtp_bits_raw) if mtp_bits_raw is not None else None
         tensor_storage = config.get("tensor_storage", {})
         codebook_name = config.get("codebook", "3inst")
         cb = cls._CODEBOOK_MAP.get(codebook_name, 0)
@@ -548,7 +563,8 @@ class EXL3Config(QuantizationConfig):
                 codebook_name)
         else:
             logger.info("EXL3: codebook=%s (cb=%d)", codebook_name, cb)
-        return cls(weight_bits, head_bits, tensor_storage, cb=cb)
+        return cls(weight_bits, head_bits, tensor_storage, cb=cb,
+                   mtp_bits=mtp_bits)
 
     @staticmethod
     def _normalize_prefix(prefix: str) -> str:
@@ -583,6 +599,10 @@ class EXL3Config(QuantizationConfig):
                     or key.startswith(prefix + ".")
                     or key_norm.startswith(norm + ".")):
                 return bits
+        # MTP layer's own MoE block (mtp.layers.N.mlp.experts): no
+        # per-tensor entries, single top-level `mtp_bits`.
+        if self._is_mtp_prefix(prefix):
+            return self.mtp_bits
         return None
 
     def _get_layer_bits(self, prefix: str) -> int | None:
@@ -621,12 +641,49 @@ class EXL3Config(QuantizationConfig):
                 if norm_unfused in self._layer_bits_normalized:
                     return self._layer_bits_normalized[norm_unfused]
 
+            # MTP layers: no per-tensor entries in tensor_storage, but a
+            # single top-level `mtp_bits` (checkpoint has mtp.* exl3 tensors).
+            if self._is_mtp_prefix(prefix):
+                return self.mtp_bits
             return None
         else:
             # Fallback when tensor_storage not available
             if "lm_head" in prefix:
                 return self.head_bits
+            if self._is_mtp_prefix(prefix):
+                return self.mtp_bits
             return self.weight_bits
+
+    def _is_mtp_prefix(self, prefix: str) -> bool:
+        """True for multi-token-predictor modules when the quant carries
+        `mtp_bits` (prefixes like `mtp.fc_embedding`, `model.mtp.layers.0…`)."""
+        if self.mtp_bits is None:
+            return False
+        return (prefix.startswith("mtp.") or ".mtp." in prefix
+                or prefix == "mtp")
+
+    def _normalize_mtp_prefix(self, prefix: str) -> str:
+        """Map a draft-model MTP prefix to the checkpoint's naming.
+
+        vLLM's MTP draft names its layers mtp.layers.<num_hidden_layers + k>
+        while the checkpoint / tensor_storage use mtp.layers.<k>. When the
+        module index is not a stored MTP index, rewrite it to the stored one
+        (exact for the usual single-MTP-layer checkpoints; with several MTP
+        layers the k-th stored index is used in order)."""
+        if not self._mtp_layer_indices or ".layers." not in prefix:
+            return prefix
+        if not (prefix.startswith("mtp.") or ".mtp." in prefix):
+            return prefix
+        import re
+        m = re.search(r"(?<=\.layers\.)\d+", prefix)
+        if m is None:
+            return prefix
+        n = int(m.group(0))
+        if n in self._mtp_layer_indices:
+            return prefix
+        idxs = self._mtp_layer_indices
+        k = idxs[0] if len(idxs) == 1 else idxs[(n - min(idxs)) % len(idxs)]
+        return prefix[: m.start()] + str(k) + prefix[m.end():]
 
     def _lookup_bits_for_unfused(self, unfused_prefix: str) -> int | None:
         """Lookup bits for a single, unfused projection prefix.
@@ -675,6 +732,9 @@ class EXL3Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Union["LinearMethodBase", "QuantizeMethodBase"] | None:
+        # Draft-model MTP modules (mtp.layers.<start+k>) → checkpoint naming
+        # (mtp.layers.<k>) so every lookup below finds the stored bits.
+        prefix = self._normalize_mtp_prefix(prefix)
         from vllm.model_executor.layers.fused_moe.routed_experts import (
             RoutedExperts,
         )

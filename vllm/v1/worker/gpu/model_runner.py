@@ -35,6 +35,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    graph_capture,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -928,22 +929,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_buffers = self.input_buffers
                 if self.pcp_manager is not None:
                     input_buffers = self.pcp_manager.input_buffers
-                self.cudagraph_manager.capture(
-                    self.model,
-                    self.model_state,
-                    input_buffers,
-                    self.intermediate_tensors,
-                    self.block_tables,
-                    self.attn_groups,
-                    self.kv_cache_config,
-                    pcp_manager=self.pcp_manager,
-                    has_lora=self.lora_config is not None,
-                    use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
-                    lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
-                )
-                if self.speculator is not None:
-                    with use_workspace_lane(self._draft_workspace_lane):
-                        self.speculator.capture()
+                # One shared capture context (single side stream / capture
+                # window) for the target AND the speculator's graphs. With
+                # separate windows per manager the draft's TP collectives hit
+                # the RCCL watchdog (hipErrorCapturedEvent) on ROCm.
+                with graph_capture(device=self.device) as cap_ctx:
+                    managers = [self.cudagraph_manager]
+                    if self.speculator is not None:
+                        managers += [
+                            getattr(self.speculator, "prefill_cudagraph_manager", None),
+                            getattr(self.speculator, "decode_cudagraph_manager", None),
+                        ]
+                    for mgr in managers:
+                        if mgr is not None:
+                            mgr.capture_context = cap_ctx
+                    self.cudagraph_manager.capture(
+                        self.model,
+                        self.model_state,
+                        input_buffers,
+                        self.intermediate_tensors,
+                        self.block_tables,
+                        self.attn_groups,
+                        self.kv_cache_config,
+                        pcp_manager=self.pcp_manager,
+                        has_lora=self.lora_config is not None,
+                        use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+                        lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
+                    )
+                    if self.speculator is not None:
+                        with use_workspace_lane(self._draft_workspace_lane):
+                            self.speculator.capture()
                 if self.adaptive_verification is not None:
                     with self.step_timing.collect() as timings:
                         for batch in self.adaptive_verification.batches_to_profile(

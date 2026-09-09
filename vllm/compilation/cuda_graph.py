@@ -314,6 +314,12 @@ class CUDAGraphWrapper:
                     cudagraph,
                     pool=self.graph_pool,
                     stream=current_stream(),
+                    # Let other threads (e.g. the NCCL/RCCL process-group
+                    # watchdog querying its work events) issue CUDA calls
+                    # during capture; the default "global" mode turns those
+                    # into hipErrorCapturedEvent aborts (seen on ROCm when
+                    # the spec-decode draft is captured).
+                    capture_error_mode="thread_local",
                 ):
                     # `output` is managed by pytorch's cudagraph pool
                     output = self.runnable(*args, **kwargs)

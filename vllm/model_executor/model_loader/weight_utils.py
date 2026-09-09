@@ -280,6 +280,54 @@ def _exl3_supplement_tensor_storage(
 
     if "tensor_storage" in full_config:
         hf_quant_config["tensor_storage"] = full_config["tensor_storage"]
+        _exl3_derive_missing_bits_from_shapes(
+            hf_folder, hf_quant_config["tensor_storage"]
+        )
+
+
+def _exl3_derive_missing_bits_from_shapes(
+    hf_folder: str, tensor_storage: dict[str, Any]
+) -> None:
+    """Add bits_per_weight for EXL3 trellis tensors that tensor_storage does
+    not list (e.g. the MTP head: turboderp writes only a top-level `mtp_bits`
+    average, while the mtp.* tensors are quantized at heterogeneous rates).
+    The rate is exact from the trellis shape: words_per_tile = 16 * bits.
+    Best-effort; shapes are read from the safetensors headers only."""
+    index_path = os.path.join(hf_folder, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return
+    try:
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        missing: dict[str, list[str]] = {}
+        for name, shard in weight_map.items():
+            if not name.endswith(".trellis"):
+                continue
+            key = name[: -len(".trellis")]
+            if key in tensor_storage:
+                continue
+            missing.setdefault(shard, []).append(key)
+        if not missing:
+            return
+        added = 0
+        for shard, keys in missing.items():
+            with safe_open(os.path.join(hf_folder, shard), "pt") as sf:
+                for key in keys:
+                    words = sf.get_slice(key + ".trellis").get_shape()[-1]
+                    if words % 16:
+                        continue
+                    # EXL3Config only indexes entries flagged quant_format=exl3
+                    tensor_storage[key] = {
+                        "quant_format": "exl3",
+                        "bits_per_weight": words // 16,
+                        "derived_from_shape": True,
+                    }
+                    added += 1
+        logger.info(
+            "EXL3: derived bits_per_weight for %d trellis tensors missing "
+            "from tensor_storage (from shapes; e.g. MTP head)", added)
+    except Exception as e:  # never block loading on this
+        logger.warning("EXL3: could not derive missing bits from shapes: %s", e)
 
 
 # TODO(woosuk): Move this to other place.
